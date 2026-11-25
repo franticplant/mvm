@@ -4,7 +4,7 @@ MANDIR ?= $(PREFIX)/share/man/man1
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test lint
+.PHONY: install uninstall test test-real lint
 
 install:
 	install -d "$(BINDIR)" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -24,6 +24,10 @@ uninstall:
 
 test:
 	python3 -m unittest discover -s tests -v
+
+# Boots real krun microVMs (needs /dev/kvm, podman, crun-krun); ~10s.
+test-real:
+	MVM_REAL=1 python3 -m unittest discover -s tests -v
 
 lint:
 	python3 -m py_compile bin/mvm tests/test_mvm.py
