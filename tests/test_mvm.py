@@ -50,7 +50,7 @@ class _Facade:
 def load_mvm():
     sys.path.insert(0, str(REPO))
     import importlib
-    names = ["core", "ecos", "cache", "project", "egress", "observer", "runtime", "cli"]
+    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "cli"]
     mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
     # reload in dependency order so cross-module imports see fresh objects
     return _Facade(mods)
@@ -461,6 +461,147 @@ class ObserverTests(Base):
         self.assertEqual([a for a in argv if a.startswith("-v") or ":/" in a], ["-v", "/o:/out:z"])
 
 
+class CheckTests(Base):
+    # Shape of real osv-scanner v2.7.1 --all-packages JSON (trimmed) for a lockfile with
+    # flatmap-stream@0.1.1 (MAL-2025-20690), lodash@4.17.15 (GHSA) and left-pad (clean).
+    OSV = {"results": [{"source": {"path": "/src/package-lock.json", "type": "lockfile"}, "packages": [
+        {"package": {"name": "flatmap-stream", "version": "0.1.1", "ecosystem": "npm"},
+         "vulnerabilities": [{"id": "MAL-2025-20690"}, {"id": "GHSA-9x64-5r7x-2q53"}]},
+        {"package": {"name": "lodash", "version": "4.17.15", "ecosystem": "npm"},
+         "vulnerabilities": [{"id": "GHSA-29mw-wpgm-hmr9"}]},
+        {"package": {"name": "left-pad", "version": "1.3.0", "ecosystem": "npm"}}]}],
+        "experimental_config": {}}
+
+    def test_parse_real_shape(self):
+        s = self.mvm.check.parse(self.OSV)
+        self.assertEqual(s["packages"], 3)
+        self.assertEqual([m["package"] for m in s["malicious"]], ["flatmap-stream"])
+        self.assertEqual(s["malicious"][0]["source"], "package-lock.json")
+        self.assertEqual([v["package"] for v in s["vulnerable"]], ["lodash"])
+        line = self.mvm.check.summary_line(s)
+        self.assertIn("MALICIOUS: flatmap-stream@0.1.1 (MAL-2025-20690)", line)
+        self.assertIn("1 with known vulnerabilities: lodash@4.17.15", line)
+        clean = self.mvm.check.parse({"results": [{"packages": [{"package": {"name": "x", "version": "1"}}]}]})
+        self.assertIn("1 package(s), no known vulnerabilities", self.mvm.check.summary_line(clean))
+        self.assertEqual(self.mvm.check.parse({"results": None})["packages"], 0)
+
+    def test_lockfiles_per_ecosystem(self):
+        for rel in ("package-lock.json", "sub/package-lock.json", "package.json", "Cargo.lock", "go.mod", "go.sum"):
+            self.write(rel, "x")
+        lf = self.mvm.check.lockfiles
+        self.assertEqual(lf(self.proj, "node"), ["package-lock.json", "sub/package-lock.json"])
+        self.assertEqual(lf(self.proj, "rust"), ["Cargo.lock"])
+        self.assertEqual(lf(self.proj, "go"), ["go.mod"])
+
+    def test_scan_without_lockfile_skips_without_a_vm(self):
+        self.write("package.json", "{}")
+        with mock.patch.object(sys.modules["mvm.runtime"], "execute") as ex:
+            s = self.mvm.check.scan_project(self.proj, "node", {})
+        ex.assert_not_called()
+        self.assertEqual(s["skipped"], "no lockfile")
+
+    def test_scan_failure_raises(self):
+        """Fail closed: a scan that did not complete is an error, never 'no findings'."""
+        self.write("package-lock.json", "{}")
+        with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="osv@sha256:x"), \
+                mock.patch.object(sys.modules["mvm.runtime"], "execute", return_value=2):
+            with self.assertRaises(self.mvm.MvmError):
+                self.mvm.check.scan_project(self.proj, "node", {})
+        with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="osv@sha256:x"), \
+                mock.patch.object(sys.modules["mvm.runtime"], "execute", return_value=0):
+            with self.assertRaises(self.mvm.MvmError):         # exit 0 but no result file
+                self.mvm.check.scan_project(self.proj, "node", {})
+
+    def test_scanner_sees_only_lockfiles_and_osv(self):
+        self.write("package-lock.json", "{}")
+        self.write("src/secret.js", "x")
+        seen = {}
+        def fake(plan):
+            seen["files"] = sorted(str(p.relative_to(plan.src)) for p in plan.src.rglob("*") if p.is_file())
+            seen["plan"] = plan
+            (plan.src / ".mvm-osv.json").write_text('{"results": []}')
+            return 0
+        with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="osv@sha256:x"), \
+                mock.patch.object(sys.modules["mvm.runtime"], "execute", side_effect=fake):
+            self.mvm.check.scan_project(self.proj, "node", {})
+        self.assertEqual(seen["files"], ["package-lock.json"])
+        p = seen["plan"]
+        self.assertEqual(p.allow, ["api.osv.dev"])
+        self.assertTrue(p.net)
+        self.assertEqual(p.caches, [])
+        self.assertIn("--no-call-analysis=all", p.cmd)               # rust call analysis runs build scripts
+        self.assertIn("--no-resolve", p.cmd)
+
+    def test_check_and_notify_config(self):
+        self.assertTrue(self.mvm.check.before_fetch(self.mvm.load_config()))          # on by default
+        self.mvm.CONFIG_PATH.write_text('[check]\nbefore_fetch = false\n[notify]\nntfy = "https://ntfy.sh/t-1"\n')
+        cfg = self.mvm.load_config()
+        self.assertFalse(self.mvm.check.before_fetch(cfg))
+        self.assertEqual(self.mvm.check.notify_url(cfg), "https://ntfy.sh/t-1")
+        for bad in ('[check]\nbefore_fetch = "no"\n', '[check]\nx = 1\n', '[notify]\nntfy = "http://ntfy.sh/t"\n',
+                    '[notify]\nntfy = "file:///etc/passwd"\n', '[notify]\nurl = "https://a/b"\n'):
+            self.mvm.CONFIG_PATH.write_text(bad)
+            with self.assertRaises(SystemExit, msg=bad):
+                self.mvm.load_config()
+
+    def test_notify_posts_and_never_raises(self):
+        import http.server
+        import threading
+        got = []
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                got.append((self.headers["Title"], self.rfile.read(int(self.headers["Content-Length"])).decode()))
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/t"
+        self.assertTrue(self.mvm.check.notify(url, "mvm check: x", "body"))
+        srv.server_close()
+        self.assertEqual(got, [("mvm check: x", "body")])
+        self.assertFalse(self.mvm.check.notify("http://127.0.0.1:9/t", "t", "m"))   # refused: no raise
+        self.assertFalse(self.mvm.check.notify("", "t", "m"))
+        self.assertFalse(self.mvm.check.notify("file:///etc/passwd", "t", "m"))
+
+    def test_fetch_refused_when_lockfile_is_malicious(self):
+        self.write("package.json", "{}")
+        mal = {"packages": 1, "malicious": [{"package": "flatmap-stream", "version": "0.1.1", "ids": ["MAL-1"]}],
+               "vulnerable": []}
+        cwd = os.getcwd()
+        os.chdir(self.proj)
+        try:
+            with mock.patch.object(sys.modules["mvm.check"], "scan_project", return_value=mal), \
+                    mock.patch.object(sys.modules["mvm.cli"], "execute") as ex:
+                rc = self.mvm.cmd_fetch([])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, self.mvm.EXIT_MALICIOUS)
+        ex.assert_not_called()                       # nothing downloaded
+        rec = json.loads(next((self.mvm.STATE_ROOT / "checks").glob("*.json")).read_text())
+        self.assertEqual(rec["ecos"]["node"]["malicious"][0]["package"], "flatmap-stream")
+
+    def test_post_check_scans_only_a_changed_lockfile(self):
+        self.write("package.json", "{}")
+        tree = Path(self.tmp.name) / "tree"
+        tree.mkdir()
+        (tree / "package.json").write_text("{}")
+        with mock.patch.object(sys.modules["mvm.check"], "scan_tree") as st:
+            self.assertEqual(self.mvm.post_check(self.proj, tree, "node", {}), "")
+        st.assert_not_called()
+        (tree / "package-lock.json").write_text("{}")
+        mal = {"packages": 1, "malicious": [{"package": "evil", "version": "1", "ids": ["MAL-1"]}], "vulnerable": []}
+        with mock.patch.object(sys.modules["mvm.check"], "scan_tree", return_value=mal):
+            self.assertIn("evil@1", self.mvm.post_check(self.proj, tree, "node", {}))
+
+    def test_known_projects_from_records(self):
+        gone = Path(self.tmp.name) / "gone"
+        for i, (kind, cwd) in enumerate([("fetch", self.proj), ("build", Path(self.tmp.name)), ("fetch", gone)]):
+            self.mvm.write_json_atomic(self.mvm.STATE_ROOT / "runs" / f"{i}.json", {"kind": kind, "cwd": str(cwd)})
+        self.assertEqual(self.mvm.check.known_projects(), [self.proj])
+
+
 class CommitTests(Base):
     """Commit-on-clean: writes reach the cache only when the command exits 0."""
 
@@ -626,6 +767,40 @@ class CommitTests(Base):
     def test_clean_net_run_commits(self):
         self.assertEqual(self._net_run({"allowed": {"a.org": {"connections": 1}}, "denied": {}}), 0)
         self.assertEqual(self.img.read_bytes(), b"WRITTEN")
+
+    def _gated(self, gate=None, rc=0, ok_exit=(0,), notify=""):
+        def fake(argv):
+            src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
+            Path(src).write_bytes(b"WRITTEN")
+            return rc
+        plan = self.mvm.Plan(kind="build", eco="go", image="i", memory="1g", cmd=["x"], src=None,
+                             caches=[self.cache], gate=gate, ok_exit=ok_exit, notify=notify)
+        with mock.patch.object(sys.modules["mvm.runtime"], "run_podman", side_effect=fake), \
+                mock.patch.object(sys.modules["mvm.runtime"], "reap_orphans", return_value=[]):
+            return self.mvm.execute(plan)
+
+    def test_gate_reason_refuses_commit(self):
+        with mock.patch.object(sys.modules["mvm.check"], "notify") as n:
+            rc = self._gated(gate=lambda: "the new lockfile pins evil@1", notify="https://n/t")
+        self.assertEqual(rc, self.mvm.EXIT_MALICIOUS)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "malicious")
+        n.assert_called_once()                       # a trip is notified
+
+    def test_empty_gate_commits_and_ok_exit_counts_as_clean(self):
+        self.assertEqual(self._gated(gate=lambda: ""), 0)
+        self.assertEqual(self.img.read_bytes(), b"WRITTEN")
+        self.img.write_bytes(b"ORIGINAL")
+        self.assertEqual(self._gated(rc=1, ok_exit=(0, 1)), 1)       # osv-scanner: 1 = findings
+        self.assertEqual(self.last_record()["result"], "committed")
+
+    def test_gate_error_discards_and_records_error(self):
+        def boom():
+            raise self.mvm.MvmError("scan failed")
+        with self.assertRaises(self.mvm.MvmError):
+            self._gated(gate=boom)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "error")       # not "interrupted"
 
     def test_stale_copy_removed_next_run(self):
         stale = self.img.with_name("c1.img.run-old")
@@ -823,6 +998,34 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         self.assertEqual(rec["observer"]["flows"], [])
         self.assertTrue(rec["observer"]["healthy"])
         self.assertEqual(rec["observer"]["discarded_bytes"], -1)     # no packets, no stats line
+
+    def test_check_blocks_malicious_lockfile(self):
+        """Proves: osv-scanner in a krun VM (only api.osv.dev reachable) flags a real MAL-
+        advisory; mvm check exits 6 and fetch refuses before creating any cache. Control:
+        a clean lockfile passes. Needs smokescreen and internet."""
+        lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
+        if not (lib / "smokescreen").is_file():
+            self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
+        (self.proj / "go.mod").unlink()
+        (self.proj / "package.json").write_text('{"name":"p","version":"1.0.0"}')
+        lock = {"name": "p", "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": {
+            "": {"name": "p", "version": "1.0.0"},
+            "node_modules/left-pad": {"version": "1.3.0"}}}
+        (self.proj / "package-lock.json").write_text(json.dumps(lock))
+        r = self.mvm("check")
+        self.assertEqual(r.returncode, 0, r.stderr)                     # control: clean
+        self.assertIn("1 package(s), no known vulnerabilities", r.stdout)
+        lock["packages"]["node_modules/flatmap-stream"] = {"version": "0.1.1"}
+        (self.proj / "package-lock.json").write_text(json.dumps(lock))
+        r = self.mvm("check")
+        self.assertEqual(r.returncode, 6, r.stderr)
+        self.assertIn("MAL-2025-20690", r.stdout)
+        self.assertIn("egress allowed: api.osv.dev", r.stderr)
+        self.assertNotIn("DENIED", r.stderr)
+        r = self.mvm("fetch")
+        self.assertEqual(r.returncode, 6, r.stderr)
+        self.assertIn("refusing to fetch", r.stderr)
+        self.assertEqual(list(self.cache.glob("*.img")), [])            # nothing was downloaded
 
     def test_masks_hide_secrets(self):
         """Proves: .git and .env are hidden inside the VM and the project is read-only."""

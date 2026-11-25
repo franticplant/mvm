@@ -32,6 +32,7 @@ KEEP_RUNS = 200
 EXIT_EGRESS_DENIED = 3     # fetch exited 0 but tried a denied host: held, not committed
 EXIT_PROXY_FAILED = 4      # egress proxy died mid-run or its log was unreadable
 EXIT_OBSERVER_FAILED = 5   # observer (enabled) died mid-run or its flows were unreadable
+EXIT_MALICIOUS = 6         # a dependency has an OSV MAL- (malicious package) advisory
 
 
 DEFAULT_MASK = [
@@ -82,9 +83,18 @@ def load_config() -> dict:
             cfg = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         die(f"{CONFIG_PATH}: {e}")
-    unknown = set(cfg) - {"mask", "images", "memory", "allow", "observer"}
+    known = ("mask", "images", "memory", "allow", "observer", "check", "notify")
+    unknown = set(cfg) - set(known)
     if unknown:
-        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory, allow, observer)")
+        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: {', '.join(known)})")
+    chk = cfg.get("check", {})
+    if not isinstance(chk, dict) or set(chk) - {"before_fetch"} or not isinstance(chk.get("before_fetch", True), bool):
+        die(f"{CONFIG_PATH}: [check] takes only before_fetch = true|false")
+    ntf = cfg.get("notify", {})
+    url = ntf.get("ntfy", "") if isinstance(ntf, dict) else None
+    if (not isinstance(ntf, dict) or set(ntf) - {"ntfy"} or not isinstance(url, str)
+            or (url and not re.fullmatch(r"https://[^\s/]+/\S+|http://(127\.0\.0\.1|localhost):\d+/\S*", url))):
+        die(f"{CONFIG_PATH}: [notify] takes only ntfy = \"https://ntfy.example/<topic>\"")
     obs = cfg.get("observer", {})
     if not isinstance(obs, dict) or set(obs) - {"enabled"} or not isinstance(obs.get("enabled", False), bool):
         die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false")

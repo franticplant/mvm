@@ -10,10 +10,11 @@ NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/6.0.tar.gz
 NDPI_SHA256 ?= 21fc40cab5505942c0b21d9bbaf73e9adf8162ddfe782e4cd072cab855a2eda9
 NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
 MANDIR ?= $(PREFIX)/share/man/man1
+SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test test-real lint smokescreen observer
+.PHONY: install uninstall test test-real lint smokescreen observer timer
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -31,6 +32,8 @@ install:
 	@echo "  zsh comp:   $(ZSH_COMPDIR)/_mvm"
 
 uninstall:
+	-systemctl --user disable --now mvm-check.timer 2>/dev/null
+	rm -f "$(SYSTEMD_USER_DIR)/mvm-check.service" "$(SYSTEMD_USER_DIR)/mvm-check.timer"
 	rm -rf "$(LIBDIR)"
 	rm -f "$(BINDIR)/mvm" "$(MANDIR)/mvm.1" "$(BASH_COMPDIR)/mvm" "$(ZSH_COMPDIR)/_mvm"
 	@echo "Removed mvm from $(PREFIX) (cache images in ~/.cache/mvm were left untouched)"
@@ -64,3 +67,11 @@ observer:
 	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-6.0.tar.gz" | sha256sum -c -
 	podman build -q -t localhost/mvm-observer:1 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
 	@echo "Built localhost/mvm-observer:1 (nDPI 6.0); enable it with [observer] enabled = true in ~/.config/mvm/config.toml"
+
+# Daily `mvm check --all` (osv-scanner on every known project's lockfiles), as a user timer.
+timer:
+	install -d "$(SYSTEMD_USER_DIR)"
+	install -m 0644 systemd/mvm-check.service systemd/mvm-check.timer "$(SYSTEMD_USER_DIR)/"
+	systemctl --user daemon-reload
+	systemctl --user enable --now mvm-check.timer
+	@systemctl --user list-timers mvm-check.timer --no-pager

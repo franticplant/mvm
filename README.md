@@ -16,6 +16,7 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 | `mvm fetch [go\|rust\|node] [-- CMD]` | yes | **only** `go.mod`/`go.sum`, `Cargo.toml`/`Cargo.lock`, `package.json`/`package-lock.json` (Cargo targets as empty stubs) | dependency caches; changed manifests are copied back |
 | `mvm build [go\|rust\|node] -- CMD` | no | the project, read-only, with `.git`, `.env*` and key files hidden | build caches, `node_modules`, and `-w DIR` |
 | `mvm run -i IMAGE -- CMD` | no | same as build | `-w DIR` only |
+| `mvm check [--all]` | only api.osv.dev | **only** the lockfiles | nothing (a check record) |
 
 - **No third-party code runs with network.** `go mod download` and `cargo fetch` run none; npm runs with `--ignore-scripts` (run them offline: `mvm build node -- npm rebuild`); Go may not download a newer toolchain (`GOTOOLCHAIN=local`).
 - **Changing dependencies** is a fetch with a command: `mvm fetch go -- go get golang.org/x/net@latest`, `mvm fetch rust -- cargo generate-lockfile`, `mvm fetch node -- npm install --ignore-scripts left-pad`. Only manifest/lockfile changes flow back, and mvm lists them.
@@ -24,6 +25,8 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 - **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
 - **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
 - **Observer (optional, off by default).** With `[observer] enabled = true`, a passive [nDPI](https://github.com/ntop/nDPI) `ndpiReader` sidecar in the proxy pod records every outbound TLS flow: SNI, JA4 and bytes, in the run record and summarised. A TLS name outside the allowlist (or no SNI) holds the run like a denial (exit 3): the proxy only sees the CONNECT host, so this catches domain fronting. It fails closed: a missing image refuses the fetch, a dead observer, unreadable flows, discarded frames, or a proxy connection with no observed flow means nothing is committed (exit 5). `mvm status` prints `observer off` when it is off.
+- **Dependency check before every fetch.** [osv-scanner](https://github.com/google/osv-scanner) checks the lockfiles in a microVM that sees only them and reaches only `api.osv.dev` through the same proxy. A package with an OSV `MAL-` advisory ([OpenSSF malicious packages](https://github.com/ossf/malicious-packages)) refuses the fetch (exit 6); known vulnerabilities are printed and recorded, not blocking. If a fetch command changed the lockfile (`npm install x`), the new lockfile is checked before anything is committed or copied back. A check that cannot complete refuses the fetch (`[check] before_fetch = false` turns it off). Call analysis and manifest resolution are off (`--no-call-analysis=all --no-resolve`): nothing runs and no other host is needed.
+- **Daily check and notifications.** `mvm check --all` checks every project mvm has fetched or checked; `make timer` installs it as a daily systemd user timer. With `[notify] ntfy = "https://ntfy.sh/<topic>"`, trips (malicious packages, held runs, failed proxy/observer, failed checks) are posted there. `mvm status` shows the last check per project and the trips of the last 24 hours.
 - **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.
 
 ## State
@@ -34,6 +37,7 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 | `~/.cache/mvm/<name>.meta.json` | generation number, last commit, owning project (for `node_modules`) |
 | `~/.cache/mvm/<name>.lock` | `flock`: shared for read-only users, exclusive for the writer |
 | `~/.local/state/mvm/pins.json` | image tag → pinned digest |
+| `~/.local/state/mvm/checks/<project>.json` | last dependency check per project and ecosystem |
 | `~/.local/state/mvm/runs/<id>.json` | one record per run: command, image, caches, exit, committed or discarded (last 200 kept) |
 | `~/.config/mvm/config.toml` | optional host config |
 
@@ -57,6 +61,12 @@ go = ["github.com", "codeload.github.com"]
 
 [observer]             # nDPI flow observer for fetch (needs `make observer`); off by default
 enabled = true
+
+[check]                # osv-scanner before every fetch; on by default
+before_fetch = true
+
+[notify]               # optional: post trips to ntfy
+ntfy = "https://ntfy.sh/<your-topic>"
 ```
 
 Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`; rust `index.crates.io`, `static.crates.io`; node `registry.npmjs.org`.
@@ -80,6 +90,7 @@ sudo dnf install podman crun-krun e2fsprogs
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
 make observer       # optional: build the nDPI observer image (nDPI 6.0 tarball pinned by sha256)
+make timer          # optional: daily `mvm check --all` as a systemd user timer
 make test           # unit tests, no KVM needed
 make test-real      # + real microVM tests, including the egress escape test
 ```
