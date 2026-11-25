@@ -168,7 +168,10 @@ class Proxy:
                 "-p", f"127.0.0.1:{self.port}:{PROXY_PORT_IN_CONTAINER}",
                 "-v", f"{binary}:/smokescreen:ro,z", "-v", f"{cfg}:/cfg:ro,z",
                 image, "/smokescreen", "--config-file", "/cfg/config.yaml",
-                "--listen-ip", "0.0.0.0", "--listen-port", str(PROXY_PORT_IN_CONTAINER)]
+                # 0.0.0.0 is inside the container's own netns; the host side is published
+                # only on 127.0.0.1 (the -p above), so nothing else can reach the proxy.
+                "--listen-ip", "0.0.0.0",  # noqa: S104
+                "--listen-port", str(PROXY_PORT_IN_CONTAINER)]
         subprocess.run(argv, check=True, stdout=subprocess.DEVNULL)
         self._wait_ready()
         return self
