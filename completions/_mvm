@@ -28,7 +28,7 @@ _mvm() {
   fi
   case "$words[2]" in
     fetch) (( CURRENT == 3 )) && _values 'ecosystem' go rust node ;;
-    build) _arguments '-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' '1::ecosystem:(go rust node)' ;;
+    build) _arguments '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' '1::ecosystem:(go rust node)' ;;
     run)   _arguments '-i[image]:image:' '-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' ;;
     cache)
       if (( CURRENT == 3 )); then

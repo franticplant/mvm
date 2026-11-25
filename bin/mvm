@@ -136,10 +136,29 @@ def now_iso() -> str:
 
 
 def load_config() -> dict:
+    """Read config.toml and reject wrong shapes (e.g. mask = ".env" would match per character)."""
     if not CONFIG_PATH.exists():
         return {}
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        die(f"{CONFIG_PATH}: {e}")
+    unknown = set(cfg) - {"mask", "images", "memory"}
+    if unknown:
+        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory)")
+    mask = cfg.get("mask", DEFAULT_MASK)
+    if not isinstance(mask, list) or not all(isinstance(m, str) and m for m in mask):
+        die(f"{CONFIG_PATH}: mask must be a list of non-empty strings")
+    images = cfg.get("images", {})
+    if not isinstance(images, dict) or not all(k in ECOS and isinstance(v, str) for k, v in images.items()):
+        die(f"{CONFIG_PATH}: [images] keys must be {sorted(ECOS)} with string values")
+    memory = cfg.get("memory", {})
+    if not isinstance(memory, dict) or not all(
+            k in (*ECOS, "run") and isinstance(v, str) and re.fullmatch(r"[0-9]+[kmgKMG]?", v)
+            for k, v in memory.items()):
+        die(f"{CONFIG_PATH}: [memory] keys must be {sorted((*ECOS, 'run'))} with sizes like \"4g\"")
+    return cfg
 
 
 def write_json_atomic(path: Path, data) -> None:
@@ -633,8 +652,11 @@ def copy_back(tree: Path, root: Path, rel: str) -> None:
         raise MvmError(f"{rel}: manifest too large")
     (root / rel).parent.mkdir(parents=True, exist_ok=True)
     tmp = (root / rel).with_name(f".{Path(rel).name}.mvm-tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, root / rel)
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, root / rel)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def cmd_fetch(args: list[str]) -> int:
