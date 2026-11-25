@@ -1,6 +1,6 @@
 # mvm
 
-Run dev tooling (`go`, `cargo`, `npm`, `python`, or any OCI image) in ephemeral KVM microVMs via **Podman + `crun-krun`** — offline and read-only by default, with `flock`-locked sparse ext4 cache images.
+Run dev tooling and AI coding agent builds (`go`, `cargo`, `npm`, `python`, or any OCI image) in ephemeral KVM microVMs via **Podman + `crun-krun`** — offline and read-only by default, with `flock`-locked sparse ext4 cache images.
 
 ## Why
 
@@ -8,6 +8,29 @@ Run dev tooling (`go`, `cargo`, `npm`, `python`, or any OCI image) in ephemeral 
 - **No `virtio-fs` / SELinux slowdown:** Your project stays as ordinary host files (`/src:ro`), while the 30,000+ compiler scratch and dependency files live inside reusable sparse ext4 `.img` files loop-mounted inside the guest kernel. SELinux `:z` only relabels **one inode** per cache image.
 - **Zero host privileges:** No `sudo`, no `--privileged`, no host namespaces. Guest `mount -o loop` and `mount -t tmpfs` run purely inside the microVM's own kernel.
 - **Safe concurrency:** Host-side `flock(2)` automatically takes shared locks (`LOCK_SH`) on read-only caches and exclusive locks (`LOCK_EX`) on writable caches, preventing ext4 corruption when running parallel builds.
+
+## Why it fits AI coding agents
+
+AI coding agents (Claude Code, Codex, Antigravity, opencode, etc.) routinely run package installs, compilers, and test suites on your workstation. Routing those commands through `mvm` keeps the workflow fast while sharply shrinking blast radius:
+
+- **No host secrets or network by default:** Builds run with `--network=none` and only see `/src:ro` (plus an explicit `-o build` output dir if needed) — never `~/.ssh`, `~/.aws`, browser profiles, or your host kernel.
+- **Clean two-phase separation:** Agents pass `--net` only for the dependency fetch step (`mvm --net --go -- go mod download`), then compile and test completely offline against the cached `.img`.
+- **Safe for parallel subagents:** Multiple agents can read shared dependency caches (`go-mod`, `cargo-reg`) concurrently (`LOCK_SH`), while writable compiler caches (`go-build`, `cargo-target`) serialize cleanly via `flock` (`LOCK_EX`) instead of racing or corrupting.
+- **Predictable, auditable one-liner:** Short enough that agents follow it reliably without forgetting flags like `--network=none`, `--memory`, or `:z`.
+
+### Drop-in snippet for `CLAUDE.md` / `GEMINI.md` / `AGENTS.md`
+
+```markdown
+- Never run node, npm, npx, pnpm, yarn, bun, deno, go, cargo or similar dev
+  tooling directly on the host.
+- Prefer `mvm` (`~/.local/bin/mvm`, see `man mvm`) — ephemeral KVM microVM
+  with `--network=none` and read-only `/src` by default, plus `flock`-locked
+  sparse ext4 caches in `~/.cache/mvm/*.img`:
+  - Fetch deps with network: `mvm --net --go -- go mod download` (or `--rust`, `--node`)
+  - Build offline: `mvm --go -o build -- go build -o /out/app ./...`
+- Fall back to plain `podman run --rm --network=none ...` only when a step
+  hits a `krun` quirk (e.g. certain loopback tests or browsers needing `--shm-size=1g`).
+```
 
 ## Requirements
 
