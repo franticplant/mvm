@@ -36,6 +36,7 @@ class Plan:
     src_rw: bool = False      # only the throwaway fetch tree is writable
     learn: bool = False       # fetch --learn: proxy reports instead of enforcing; never commits
     allow: list[str] = field(default_factory=list)      # egress allowlist for net runs
+    egress_result: dict = field(default_factory=dict)   # filled by execute(): this run's egress summary
 
 
 def new_run_id() -> str:
@@ -119,11 +120,6 @@ def record_path(run_id: str) -> Path:
     return core.STATE_ROOT / "runs" / f"{run_id}.json"
 
 
-def latest_record() -> dict:
-    recs = sorted((core.STATE_ROOT / "runs").glob("*.json"))
-    return core.read_json(recs[-1], {}) if recs else {}
-
-
 def prune_records() -> None:
     recs = sorted((core.STATE_ROOT / "runs").glob("*.json"))
     for old in recs[:-KEEP_RUNS]:
@@ -172,10 +168,18 @@ def execute(plan: Plan) -> int:
                     kill_container(run_id)
                     raise
             if plan.net:                      # the proxy has stopped: its log is complete
-                rec["egress"].update(px.summary)
+                rec["egress"].update(px.summary, proxy_healthy=px.healthy)
+                plan.egress_result = rec["egress"]
                 say(f"{label}: {egress.summary_line(px.summary)}")
             if rc == 0 and plan.learn:
                 result = "learned"            # learning never changes caches
+            elif rc == 0 and plan.net and not px.healthy:
+                result, rc = "proxy-failed", core.EXIT_PROXY_FAILED
+                say(f"{label}: the egress proxy died or its log was unreadable; nothing committed")
+            elif rc == 0 and plan.net and px.summary["denied"]:
+                result, rc = "held", core.EXIT_EGRESS_DENIED
+                say(f"{label}: egress was denied, so this run is not trusted: nothing committed. "
+                    "Check the hosts with `mvm fetch --learn` and allow them in [allow] if expected")
             elif rc == 0:
                 rec["generations"] = {n: commit_copy(n, cp, run_id) for n, cp in copies.items()}
                 copies.clear()

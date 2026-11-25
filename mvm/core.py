@@ -29,6 +29,8 @@ LIB_DIR = Path(os.environ.get("MVM_LIB_DIR", HOME / ".local" / "lib" / "mvm"))
 
 
 KEEP_RUNS = 200
+EXIT_EGRESS_DENIED = 3     # fetch exited 0 but tried a denied host: held, not committed
+EXIT_PROXY_FAILED = 4      # egress proxy died mid-run or its log was unreadable
 
 
 DEFAULT_MASK = [
@@ -58,6 +60,18 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def valid_allow_host(h) -> bool:
+    """A DNS name with at least two labels; `*.` only in front of at least two labels
+    (so *.github.com, never *.com); no IP literals."""
+    if not isinstance(h, str):
+        return False
+    name = h[2:] if h.startswith("*.") else h
+    labels = name.split(".")
+    if len(labels) < 2 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", lab) for lab in labels):
+        return False
+    return not all(lab.isdigit() for lab in labels)
+
+
 def load_config() -> dict:
     """Read config.toml and reject wrong shapes (e.g. mask = ".env" would match per character)."""
     if not CONFIG_PATH.exists():
@@ -72,7 +86,7 @@ def load_config() -> dict:
         die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory, allow)")
     allow = cfg.get("allow", {})
     if not isinstance(allow, dict) or not all(
-            k in ECOS and isinstance(v, list) and all(isinstance(h, str) and re.fullmatch(r"(\*\.)?[A-Za-z0-9.-]+", h) for h in v)
+            k in ECOS and isinstance(v, list) and all(valid_allow_host(h) for h in v)
             for k, v in allow.items()):
         die(f"{CONFIG_PATH}: [allow] keys must be {sorted(ECOS)} with lists of host names")
     mask = cfg.get("mask", DEFAULT_MASK)

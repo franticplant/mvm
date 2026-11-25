@@ -139,7 +139,10 @@ One JSON record per run (last 200).
 .BR MVM_CACHE_DIR ", " MVM_STATE_DIR ", " MVM_CONFIG
 override the paths above.
 .SH EXIT STATUS
-The command's exit status; 2 for usage errors; 130 when interrupted.
+The command's exit status; 2 for usage errors; 130 when interrupted;
+3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
+nothing is committed or copied back); 4 when the egress proxy died mid\-run or
+its log could not be read (nothing committed).
 .SH EXAMPLES
 .nf
 mvm fetch

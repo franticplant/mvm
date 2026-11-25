@@ -89,7 +89,7 @@ def cmd_fetch(args: list[str]) -> int:
             if rc != 0:
                 return rc
             if learn:
-                report_learned(name, plan.allow)
+                report_learned(name, plan.egress_result)
                 continue
             # Only dependency manifests ever flow back into the project.
             for rel in changed_manifests(root, tree, eco):
@@ -100,15 +100,14 @@ def cmd_fetch(args: list[str]) -> int:
     return 0
 
 
-def report_learned(eco: str, allowed: list[str]) -> None:
-    """After a --learn fetch: which hosts were used beyond the allowlist."""
-    from .runtime import latest_record
-    rec = latest_record()
-    eg = rec.get("egress", {})
-    seen = sorted({*eg.get("allowed", {}), *eg.get("denied", {})})
-    extra = [h for h in eg.get("outside_allowlist", []) if h not in allowed]
+def report_learned(eco: str, result: dict) -> None:
+    """After a --learn fetch: hosts the proxy let through only because of learn mode."""
+    extra = result.get("outside_allowlist", [])
+    refused = sorted(result.get("denied", {}))
+    if refused:
+        say(f"{eco}: refused even in learn mode (Smokescreen IP rules, cannot be allowed): {', '.join(refused)}")
     if not extra:
-        say(f"{eco}: every host used is already allowed ({', '.join(seen) or 'none'})")
+        say(f"{eco}: no hosts outside the allowlist")
         return
     hosts = ", ".join(f'"{h}"' for h in extra)
     say(f"{eco}: hosts outside the allowlist: {', '.join(extra)}")

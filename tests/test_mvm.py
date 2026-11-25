@@ -283,6 +283,38 @@ class EgressTests(Base):
         self.assertEqual(list(s["allowed"]), ["proxy.golang.org"])
         self.assertEqual(s["allowed"]["proxy.golang.org"]["connections"], 3)
 
+    def test_allow_hosts_validated(self):
+        ok = ["github.com", "*.github.com", "codeload.github.com", "a-b.example.co"]
+        bad = ["*.com", "com", ".", "..", "1.2.3.4", "*.1.2.3", "http://x.org", "x..org", "-x.org", 5]
+        for h in ok:
+            self.assertTrue(self.mvm.valid_allow_host(h), h)
+        for h in bad:
+            self.assertFalse(self.mvm.valid_allow_host(h), h)
+
+    def test_summarize_never_drops_a_decision(self):
+        D = "CANONICAL-PROXY-DECISION"
+        lines = ['{"msg":"%s","id":"same","requested_host":"a.org:443","allow":false}' % D,
+                 '{"msg":"%s","id":"same","requested_host":"a.org:443","allow":false}' % D,   # same id
+                 '{"msg":"%s","allow":false,"decision_reason":"bad request"}' % D,             # no host
+                 '{"msg":"%s","id":"v6","requested_host":"[2001:db8::1]:443","allow":false}' % D]
+        s = self.mvm.summarize(lines)
+        self.assertEqual(s["denied"]["a.org"]["connections"], 2)
+        self.assertIn("(unknown)", s["denied"])
+        self.assertIn("2001:db8::1", s["denied"])
+
+    def test_proxy_start_failure_cleans_up(self):
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
+        self.mvm.LIB_DIR.mkdir()
+        (self.mvm.LIB_DIR / "smokescreen").write_text("")
+        px = self.mvm.Proxy("RID", ["a.org"], "enforce")
+        stopped = []
+        with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="img@sha256:x"), \
+                mock.patch.object(px, "_start", side_effect=KeyboardInterrupt), \
+                mock.patch.object(px, "_stop", side_effect=lambda: stopped.append(1) or []):
+            with self.assertRaises(KeyboardInterrupt):
+                px.__enter__()
+        self.assertEqual(stopped, [1])
+
     def test_summarize_real_smokescreen_log_shapes(self):
         # Field shapes copied from a real Smokescreen v2 run (report mode, go mod download).
         D, C = "CANONICAL-PROXY-DECISION", "CANONICAL-PROXY-CN-CLOSE"
@@ -298,7 +330,7 @@ class EgressTests(Base):
         s = self.mvm.summarize(lines)
         self.assertEqual(s["allowed"]["proxy.golang.org"], {"connections": 1, "bytes_in": 11372, "bytes_out": 1620})
         self.assertEqual(s["denied"]["evil.example"]["reason"], "host not allowed")
-        self.assertEqual(s["outside_allowlist"], ["evil.example", "storage.googleapis.com"])
+        self.assertEqual(s["outside_allowlist"], ["storage.googleapis.com"])   # denied hosts are never suggested
         line = self.mvm.summary_line(s)
         self.assertIn("DENIED: evil.example (1x)", line)
         self.assertIn("outside the allowlist (learn mode): storage.googleapis.com", line)
@@ -359,7 +391,7 @@ class CommitTests(Base):
 
     def test_learn_never_commits(self):
         class FakeProxy:
-            def __init__(self, *a): self.port = 1; self.summary = {"allowed": {}, "denied": {}}
+            def __init__(self, *a): self.port = 1; self.healthy = True; self.summary = {"allowed": {}, "denied": {}}
             def __enter__(self): return self
             def __exit__(self, *e): return False
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
@@ -378,6 +410,42 @@ class CommitTests(Base):
         self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
         self.assertEqual(self.last_record()["result"], "learned")
         self.assertEqual(self.last_record()["egress"]["mode"], "learn")
+
+    def _net_run(self, summary, healthy=True):
+        class FakeProxy:
+            def __init__(self, *a): self.port = 1; self.healthy = healthy; self.summary = summary
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
+        self.mvm.LIB_DIR.mkdir(exist_ok=True)
+        (self.mvm.LIB_DIR / "smokescreen").write_text("")
+        def fake(argv):
+            src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
+            Path(src).write_bytes(b"WRITTEN")
+            return 0
+        plan = self.mvm.Plan(kind="fetch", eco="go", image="i", memory="1g", cmd=["x"], src=None,
+                             caches=[self.cache], net=True, allow=["a.org"])
+        with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy), \
+                mock.patch.object(sys.modules["mvm.runtime"], "run_podman", side_effect=fake), \
+                mock.patch.object(sys.modules["mvm.runtime"], "reap_orphans", return_value=[]):
+            return self.mvm.execute(plan)
+
+    def test_denied_egress_holds_the_run(self):
+        """Exit 0 is not enough: a run that tried a denied host is not committed."""
+        rc = self._net_run({"allowed": {}, "denied": {"evil.example": {"connections": 1}}})
+        self.assertEqual(rc, self.mvm.EXIT_EGRESS_DENIED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "held")
+
+    def test_dead_proxy_fails_the_run(self):
+        rc = self._net_run({"allowed": {}, "denied": {}}, healthy=False)
+        self.assertEqual(rc, self.mvm.EXIT_PROXY_FAILED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "proxy-failed")
+
+    def test_clean_net_run_commits(self):
+        self.assertEqual(self._net_run({"allowed": {"a.org": {"connections": 1}}, "denied": {}}), 0)
+        self.assertEqual(self.img.read_bytes(), b"WRITTEN")
 
     def test_stale_copy_removed_next_run(self):
         stale = self.img.with_name("c1.img.run-old")
@@ -479,7 +547,8 @@ class RealTests(unittest.TestCase):
     def test_escape(self):
         """Proves: a fetch VM's only way out is the allowlist proxy. Direct TCP, DNS and
         CONNECT to an unlisted host fail; CONNECT to an allowed host succeeds; the denial
-        lands in the run record. Needs the Smokescreen binary and internet."""
+        lands in the run record and holds the run (exit 3, nothing committed).
+        Needs the Smokescreen binary (MVM_LIB_DIR or ~/.local/lib/mvm) and internet."""
         lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
         if not (lib / "smokescreen").is_file():
             self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
@@ -492,7 +561,8 @@ class RealTests(unittest.TestCase):
             'echo "allowed=$(conn proxy.golang.org)"'
         )
         r = self.mvm("fetch", "go", "--", "sh", "-c", probe)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        # The probe itself tried an unlisted host, so the run is held (exit 3), not committed.
+        self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("direct=closed", r.stdout)
         self.assertIn("dns=0", r.stdout)
         self.assertRegex(r.stdout, r"unlisted=HTTP/1\.[01] 40[37]")
@@ -500,6 +570,7 @@ class RealTests(unittest.TestCase):
         recs = sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))
         rec = json.loads(recs[-1].read_text())
         self.assertEqual(rec["egress"]["mode"], "enforce")
+        self.assertEqual(rec["result"], "held")
         self.assertIn("example.com", rec["egress"]["denied"])
         self.assertIn("proxy.golang.org", rec["egress"]["allowed"])
         self.assertIn("DENIED: example.com", r.stderr)
