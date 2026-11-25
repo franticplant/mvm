@@ -190,7 +190,12 @@ def execute(plan: Plan) -> int:
                 plan.egress_result = rec["egress"]
                 say(f"{label}: {egress.summary_line(px.summary)}")
                 if plan.observe:
-                    rec["observer"] = {**ob.summary, "healthy": ob.healthy}
+                    missed = observer.unobserved(ob.summary, px.summary)
+                    if missed:
+                        ob.healthy = False
+                        say(f"{label}: the observer has no flow for {missed} connection(s) the proxy made")
+                    rec["observer"] = {**ob.summary, "healthy": ob.healthy, "unobserved_connections": missed,
+                                       "discarded_bytes": getattr(ob, "discarded", None)}
                     plan.egress_result = {**rec["egress"], "observer": rec["observer"]}
                     say(f"{label}: {observer.summary_line(ob.summary)}")
             observed_ok = not (plan.net and plan.observe) or ob.healthy

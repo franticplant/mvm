@@ -75,7 +75,8 @@ each outbound TLS flow's SNI, JA4 and bytes in the run record. A TLS name
 outside the allowlist, or a flow without SNI, holds the run (exit 3). The
 observer fails closed: without its image
 .RB ( "make observer" )
-fetch refuses to run, and a dead observer commits nothing (exit 5).
+fetch refuses to run; a dead observer, discarded frames, or a proxy connection
+without an observed flow commits nothing (exit 5).
 .PP
 .B build
 runs offline in the current project, mounted read\-only at
@@ -155,7 +156,8 @@ The command's exit status; 2 for usage errors; 130 when interrupted;
 3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
 nothing is committed or copied back); 4 when the egress proxy died mid\-run or
 its log could not be read (nothing committed); 5 when the observer was on and
-died mid\-run or its flows could not be read (nothing committed).
+died mid\-run, its flows could not be read, it discarded frames, or it missed a
+connection the proxy made (nothing committed).
 .SH EXAMPLES
 .nf
 mvm fetch

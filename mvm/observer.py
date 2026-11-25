@@ -14,8 +14,8 @@ MTU 1500 first. Then SNI, JA4 and goodput (equal to Smokescreen's byte counts) a
 
 from __future__ import annotations
 
-import fnmatch
 import json
+import re
 import os
 import subprocess
 import tempfile
@@ -28,6 +28,8 @@ from . import core
 OBSERVER_IMAGE = "localhost/mvm-observer:1"
 READY_MARK = "Capturing live traffic"
 READY_TIMEOUT = 15.0
+# ndpiReader prints its traffic statistics on SIGINT; frames it could not parse count here.
+DISCARDED_RE = re.compile(r"Discarded bytes:\s+(\d+)")
 
 
 def enabled(cfg: dict) -> bool:
@@ -50,10 +52,14 @@ def sidecar_argv(pod: str, name: str, run_id: str, iface: str, out: Path) -> lis
 
 
 def _matches(host: str, allow: list[str]) -> bool:
+    """Smokescreen's semantics (acl.go hostMatchesGlob): `*.x` matches any subdomain of x
+    at any depth, never x itself. An SNI with an empty label (".x", "a..x") never matches."""
     host = host.lower().rstrip(".")
+    if not host or "" in host.split("."):
+        return False
     for a in allow:
-        a = a.lower()
-        if host == a or (a.startswith("*.") and fnmatch.fnmatchcase(host, a) and host.count(".") >= a.count(".")):
+        a = a.lower().rstrip(".")
+        if host == a or (a.startswith("*.") and host.endswith(a[1:])):
             return True
     return False
 
@@ -83,6 +89,14 @@ def summarize(lines: list[str], allow: list[str]) -> dict:
     return {"flows": flows, "ja4": sorted({f["ja4"] for f in flows if f["ja4"]}), "outside_allowlist": outside}
 
 
+def unobserved(s: dict, proxy_summary: dict) -> int:
+    """Connections the proxy dialed that the observer has no flow for. Every allowed
+    CONNECT is one outbound TCP flow to port 443 (denied ones never dial), so fewer
+    flows than connections means the capture missed some (e.g. drops under load)."""
+    dialed = sum(int(v.get("connections", 0)) for v in proxy_summary.get("allowed", {}).values())
+    return max(0, dialed - len(s["flows"]))
+
+
 def summary_line(s: dict) -> str:
     snis = sorted({f["sni"] or "(no sni)" for f in s["flows"]})
     out = f"observer: {len(s['flows'])} TLS flow(s), SNI {', '.join(snis) or 'none'}; JA4 {', '.join(s['ja4']) or 'none'}"
@@ -102,7 +116,8 @@ class Observer:
         self.name = f"{pod}-observer"
         self._dir: tempfile.TemporaryDirectory | None = None
         self.summary: dict = {"flows": [], "ja4": [], "outside_allowlist": []}
-        self.healthy = False                  # ran the whole time and its flow file was read
+        self.healthy = False                  # ran the whole time, flow file read, nothing discarded
+        self.discarded = -1                   # ndpiReader's "Discarded bytes" (-1: no stats line)
 
     def __enter__(self) -> Observer:
         if not image_present():
@@ -152,7 +167,14 @@ class Observer:
                 lines = (Path(self._dir.name) / "flows.json").read_text().splitlines()
             except OSError:
                 lines = None
-        self.healthy = alive and code == "0" and lines is not None
+        # Fail closed on capture loss too: no discarded frames. ndpiReader prints no stats at all
+        # after zero packets (seen in a real quiet fetch), so a missing stats line is accepted
+        # only with an empty flow file; connections the proxy made then fail via unobserved().
+        m = DISCARDED_RE.search(self._logs())
+        self.discarded = int(m.group(1)) if m else -1
+        quiet = lines is not None and not any(ln.strip() for ln in lines)
+        stats_ok = self.discarded == 0 or (self.discarded == -1 and quiet)
+        self.healthy = alive and code == "0" and lines is not None and stats_ok
         return lines
 
     def _cleanup(self) -> None:

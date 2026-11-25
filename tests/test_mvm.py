@@ -429,6 +429,28 @@ class ObserverTests(Base):
         self.assertIn("SNI OUTSIDE THE ALLOWLIST", self.mvm.observer.summary_line(s))
         self.assertEqual(self.mvm.observer.summarize([sub], ["*.codeload.github.com"])["outside_allowlist"],
                          ["Codeload.GitHub.com."])          # *.x never matches x itself
+        m = self.mvm.observer._matches
+        self.assertTrue(m("a.b.github.com", ["*.github.com"]))        # any depth, as Smokescreen
+        for bad in (".github.com", "a..github.com", "github.com", "evilgithub.com", ""):
+            self.assertFalse(m(bad, ["*.github.com"]), bad)
+
+    def test_stop_health_needs_clean_exit_flows_and_zero_discarded(self):
+        cases = [("Discarded bytes:       0\n", "0", True, self.REAL), ("Discarded bytes:       23222\n", "0", False, self.REAL),
+                 ("", "0", False, self.REAL),          # flows but no stats line: not trusted
+                 ("", "0", True, ""),                  # zero packets: ndpiReader prints no stats
+                 ("Discarded bytes: 0\n", "137", False, self.REAL)]
+        for logs, code, healthy, flows in cases:
+            ob = self.mvm.observer.Observer("RID", "pod", "eth0", ["a.org"])
+            ob._dir = tempfile.TemporaryDirectory()
+            (Path(ob._dir.name) / "flows.json").write_text(flows + "\n")
+            ret = subprocess.CompletedProcess([], 0, code + "\n", "")
+            with mock.patch.object(ob, "_running", return_value=True), \
+                    mock.patch.object(ob, "_logs", return_value=logs), \
+                    mock.patch("subprocess.run", return_value=ret):
+                lines = ob._stop()
+            self.assertEqual(ob.healthy, healthy, (logs, code, flows[:9]))
+            self.assertEqual(len(lines), 1)
+            ob._dir.cleanup()
 
     def test_sidecar_is_capture_only(self):
         argv = self.mvm.observer.sidecar_argv("pod", "pod-observer", "RID", "eth0", Path("/o"))
@@ -557,6 +579,15 @@ class CommitTests(Base):
         self.assertEqual(rc, self.mvm.EXIT_OBSERVER_FAILED)
         self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
         self.assertEqual(self.last_record()["result"], "observer-failed")
+
+    def test_unobserved_connection_fails_the_run(self):
+        """A proxy connection with no observed flow (capture missed it) is not trusted."""
+        two = {"allowed": {"a.org": {"connections": 2}}, "denied": {}}
+        rc = self._net_run(two, observed=({"flows": [{"sni": "a.org"}], "ja4": [], "outside_allowlist": []}, True))
+        self.assertEqual(rc, self.mvm.EXIT_OBSERVER_FAILED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["observer"]["unobserved_connections"], 1)
+        self.assertFalse(self.last_record()["observer"]["healthy"])
 
     def test_sni_outside_allowlist_holds_the_run(self):
         """Domain fronting: CONNECT to an allowed host, TLS SNI for another name."""
@@ -771,10 +802,27 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         self.assertEqual(rec["result"], "held")
         self.assertEqual(rec["egress"]["denied"], {})                    # the proxy saw nothing wrong
         self.assertTrue(rec["observer"]["healthy"])
+        self.assertEqual(rec["observer"]["discarded_bytes"], 0)
+        self.assertEqual(rec["observer"]["unobserved_connections"], 0)
         self.assertEqual(rec["observer"]["outside_allowlist"], ["example.com"])
         self.assertEqual(sorted({f["sni"] for f in rec["observer"]["flows"]}), ["example.com", "proxy.golang.org"])
         self.assertTrue(all(f["ja4"] for f in rec["observer"]["flows"]))
         self.assertIn("SNI OUTSIDE THE ALLOWLIST: example.com", r.stderr)
+
+    def test_observer_quiet_fetch_commits(self):
+        """Proves: with the observer on, a fetch that makes no connection still commits
+        (ndpiReader writes a flow file and a clean stats line even with no traffic)."""
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        cfg = Path(self.tmp.name) / "obs.toml"
+        cfg.write_text("[observer]\nenabled = true\n")
+        self.env["MVM_CONFIG"] = str(cfg)
+        r = self.mvm("fetch", "go", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
+        self.assertEqual(rec["observer"]["flows"], [])
+        self.assertTrue(rec["observer"]["healthy"])
+        self.assertEqual(rec["observer"]["discarded_bytes"], -1)     # no packets, no stats line
 
     def test_masks_hide_secrets(self):
         """Proves: .git and .env are hidden inside the VM and the project is read-only."""
