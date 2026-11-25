@@ -31,6 +31,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -588,16 +589,52 @@ def image_for(cfg: dict, eco: Eco) -> str:
     return pinned(cfg.get("images", {}).get(eco.name, eco.image))
 
 
+MAX_MANIFEST = 64 * 1024 * 1024
+
+
+def _regular(path: Path) -> bool:
+    """True only for a regular file that is not a symlink (lstat, never follows links)."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
 def changed_manifests(root: Path, tree: Path, eco: Eco) -> list[str]:
-    """Manifest/lockfile paths in tree that are new or differ from the project."""
+    """Manifest/lockfile paths in tree that are new or differ from the project.
+
+    The tree was writable inside the fetch VM, so anything in it may be hostile:
+    symlinks (to files or via parent dirs) are never followed, only regular files
+    are considered, and the project-side target must not be a symlink either.
+    """
     out = []
-    for p in sorted(tree.rglob("*")):
-        if p.is_file() and p.name in eco.manifests:
+    for dirpath, dirnames, filenames in os.walk(tree, followlinks=False):
+        d = Path(dirpath)
+        dirnames[:] = sorted(n for n in dirnames if not (d / n).is_symlink() and n != "node_modules")
+        for f in sorted(filenames):
+            p = d / f
+            if f not in eco.manifests or not _regular(p) or p.lstat().st_size > MAX_MANIFEST:
+                continue
             rel = p.relative_to(tree)
             dst = root / rel
-            if not dst.is_file() or dst.read_bytes() != p.read_bytes():
+            if any((root / part).is_symlink() for part in [*reversed(rel.parents)][1:]) or dst.is_symlink():
+                continue
+            if not _regular(dst) or dst.read_bytes() != p.read_bytes():
                 out.append(str(rel))
     return out
+
+
+def copy_back(tree: Path, root: Path, rel: str) -> None:
+    """Copy one vetted manifest without following a symlink swapped in meanwhile."""
+    fd = os.open(tree / rel, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fsrc:
+        data = fsrc.read(MAX_MANIFEST + 1)
+    if len(data) > MAX_MANIFEST:
+        raise MvmError(f"{rel}: manifest too large")
+    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+    tmp = (root / rel).with_name(f".{Path(rel).name}.mvm-tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, root / rel)
 
 
 def cmd_fetch(args: list[str]) -> int:
@@ -636,8 +673,7 @@ def cmd_fetch(args: list[str]) -> int:
                 return rc
             # Only dependency manifests ever flow back into the project.
             for rel in changed_manifests(root, tree, eco):
-                (root / rel).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(tree / rel, root / rel)
+                copy_back(tree, root, rel)
                 say(f"updated {rel}")
     if "node" in ecos:
         say("node: install scripts were skipped; run them offline: mvm build node -- npm rebuild")

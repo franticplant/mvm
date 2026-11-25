@@ -104,6 +104,27 @@ class ProjectTests(Base):
         got = self.mvm.changed_manifests(self.proj, tree, self.mvm.ECOS["node"])
         self.assertEqual(got, ["package-lock.json", "sub/package.json"])
 
+    def test_symlinks_in_fetch_tree_never_followed(self):
+        """A hostile fetch VM may plant symlinks; host files must never be copied in."""
+        secret = Path(self.tmp.name) / "id_ed25519"
+        secret.write_text("PRIVATE KEY")
+        (Path(self.tmp.name) / "outside").mkdir()
+        (Path(self.tmp.name) / "outside" / "go.mod").write_text("STOLEN")
+        self.write("go.mod", "module x\n")
+        tree = Path(self.tmp.name) / "tree"
+        tree.mkdir()
+        (tree / "go.mod").symlink_to(secret)                       # file symlink
+        (tree / "sub").symlink_to(Path(self.tmp.name) / "outside") # dir symlink
+        (tree / "real").mkdir()
+        (tree / "real" / "go.sum").write_text("ok")
+        got = self.mvm.changed_manifests(self.proj, tree, self.mvm.ECOS["go"])
+        self.assertEqual(got, ["real/go.sum"])
+        os.unlink(tree / "real" / "go.sum")
+        (tree / "real" / "go.sum").symlink_to(secret)              # swapped after vetting
+        with self.assertRaises(OSError):
+            self.mvm.copy_back(tree, self.proj, "real/go.sum")
+        self.assertFalse((self.proj / "real" / "go.sum").exists())
+
     def test_masks_found_and_skip_dirs_ignored(self):
         (self.proj / ".git").mkdir()
         self.write(".env", "x")
