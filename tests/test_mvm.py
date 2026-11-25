@@ -157,6 +157,19 @@ class ProjectTests(Base):
         self.assertEqual(self.mvm.image_repo("localhost:5000/x:t"), "localhost:5000/x")
 
 
+class ConfigTests(Base):
+    def test_valid_config_loads(self):
+        self.mvm.CONFIG_PATH.write_text('mask = [".env"]\n[images]\ngo = "x:1"\n[memory]\nrun = "1g"\n')
+        self.assertEqual(self.mvm.load_config()["mask"], [".env"])
+
+    def test_wrong_shapes_rejected(self):
+        for bad in ('mask = ".env"\n', 'mask = [""]\n', 'masks = []\n', '[images]\npython = "x"\n',
+                    '[memory]\ngo = "lots"\n', 'mask = [\n'):
+            self.mvm.CONFIG_PATH.write_text(bad)
+            with self.assertRaises(SystemExit, msg=bad):
+                self.mvm.load_config()
+
+
 class PodmanArgvTests(Base):
     def plan(self, **kw):
         base = dict(kind="build", eco="go", image="img@sha256:abc", memory="2g",
