@@ -39,6 +39,10 @@ table inet mvm_egress {
     oifname "lo" accept
     ct state established,related accept
     ip daddr $NS meta l4proto { tcp, udp } th dport 53 accept
+    # Defence in depth (Smokescreen refuses these too): never private, CGNAT/tailnet,
+    # link-local, loopback or multicast destinations, whatever a name resolves to.
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } reject
+    ip6 daddr { ::/127, fc00::/7, fe80::/10, ff00::/8 } reject
     tcp dport 443 accept
     meta l4proto tcp reject with tcp reset
     reject

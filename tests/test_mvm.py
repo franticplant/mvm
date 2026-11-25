@@ -323,6 +323,10 @@ class EgressTests(Base):
         self.assertIn("th dport 53 accept", fw)            # DNS only to the pod's resolver
         self.assertNotIn("dport 80", fw)
         self.assertIn("table inet", fw)                     # IPv4 and IPv6
+        for rng in ("10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"):
+            self.assertIn(rng, fw)
+        # the private-range reject must come before the 443 accept
+        self.assertLess(fw.index("100.64.0.0/10"), fw.index("tcp dport 443 accept"))
 
     def _start_with(self, fw_stdout, fw_rc=0):
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
