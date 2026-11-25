@@ -22,6 +22,12 @@ jobs:
           make lint
           man --warnings -E UTF-8 -l man/mvm.1 >/dev/null
 
+      - name: ruff (pyflakes, bugbear, bandit-style checks)
+        run: pipx run ruff==0.8.4 check --select E9,F,B,S --ignore S603,S607,S108 bin/mvm mvm tests
+
+      - name: shellcheck completions
+        run: shellcheck --shell=bash completions/mvm.bash
+
       - name: Run unit tests
         run: make test
 
@@ -30,10 +36,12 @@ jobs:
           TMPPREFIX="$(mktemp -d)"
           make install PREFIX="$TMPPREFIX"
           test -x "$TMPPREFIX/bin/mvm"
+          (cd / && "$TMPPREFIX/bin/mvm" --help | grep -q "mvm fetch")
           test -f "$TMPPREFIX/share/man/man1/mvm.1"
           test -f "$TMPPREFIX/share/bash-completion/completions/mvm"
           make uninstall PREFIX="$TMPPREFIX"
           test ! -e "$TMPPREFIX/bin/mvm"
+          test ! -e "$TMPPREFIX/lib/mvm"
           rm -rf "$TMPPREFIX"
 
   secrets:

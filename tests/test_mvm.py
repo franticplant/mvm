@@ -7,8 +7,6 @@ and run only with MVM_REAL=1; each takes a few seconds.
 from __future__ import annotations
 
 import fcntl
-import importlib.machinery
-import importlib.util
 import json
 import os
 import signal
@@ -24,13 +22,38 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "bin" / "mvm"
 
 
+class _Facade:
+    """One object over the mvm package modules, like the old single-file module.
+
+    Reads come from the first module (in dependency order) that has the name;
+    writes (test overrides, mock.patch) go to every module holding it, so names
+    imported into other modules are overridden too.
+    """
+
+    def __init__(self, mods):
+        object.__setattr__(self, "_mods", mods)
+
+    def __getattr__(self, name):
+        for m in self._mods:
+            if hasattr(m, name):
+                return getattr(m, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        hit = [m for m in self._mods if hasattr(m, name)]
+        if not hit:
+            raise AttributeError(name)
+        for m in hit:
+            setattr(m, name, value)
+
+
 def load_mvm():
-    loader = importlib.machinery.SourceFileLoader("mvm_mod", str(SCRIPT))
-    spec = importlib.util.spec_from_loader("mvm_mod", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["mvm_mod"] = mod          # dataclasses resolve annotations via sys.modules
-    loader.exec_module(mod)
-    return mod
+    sys.path.insert(0, str(REPO))
+    import importlib
+    names = ["core", "ecos", "cache", "project", "runtime", "cli"]
+    mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
+    # reload in dependency order so cross-module imports see fresh objects
+    return _Facade(mods)
 
 
 class Base(unittest.TestCase):
@@ -226,9 +249,9 @@ class CommitTests(Base):
             return behaviour()
         plan = self.mvm.Plan(kind="build", eco="go", image="i", memory="1g", cmd=["x"],
                              src=None, caches=[self.cache])
-        with mock.patch.object(self.mvm, "run_podman", side_effect=fake), \
-                mock.patch.object(self.mvm, "reap_orphans", return_value=[]), \
-                mock.patch.object(self.mvm, "kill_container"):
+        with mock.patch.object(sys.modules["mvm.runtime"], "run_podman", side_effect=fake), \
+                mock.patch.object(sys.modules["mvm.runtime"], "reap_orphans", return_value=[]), \
+                mock.patch.object(sys.modules["mvm.runtime"], "kill_container"):
             return self.mvm.execute(plan)
 
     def gen(self):
