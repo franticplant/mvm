@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""mvm — Run dev tooling in ephemeral Podman+krun microVMs with ext4 cache images.
+
+Defaults:
+  - Hardware-virtualized microVM (--runtime krun, zero host privileges)
+  - Offline (--network=none); pass --net to enable network (e.g. fetching deps)
+  - Current directory mounted read-only at /src (-w /src); pass --rw or -o DIR
+  - Named sparse ext4 cache images in ~/.cache/mvm/*.img, auto-locked via flock
+    (shared lock for :ro, exclusive lock for RW) and cleanly loop-mounted inside
+    the guest kernel.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CACHE_ROOT = Path(os.environ.get("MVM_CACHE_DIR", Path.home() / ".cache" / "mvm"))
+
+# Built-in convenience profiles. Override images via env vars if desired.
+PROFILES = {
+    "go": {
+        "image": os.environ.get("MVM_GO_IMAGE", "docker.io/library/golang:1.27-alpine"),
+        "memory": "2g",
+        "env": {"CGO_ENABLED": "0", "GOMODCACHE": "/cache/go-mod", "GOCACHE": "/cache/go-build"},
+        # (cache_name, guest_mount, rw_when_offline, default_size)
+        "caches": [
+            ("go-mod", "/cache/go-mod", False, "2G"),
+            ("go-build", "/cache/go-build", True, "5G"),
+        ],
+    },
+    "rust": {
+        "image": os.environ.get("MVM_RUST_IMAGE", "docker.io/library/rust:1.98-alpine"),
+        "memory": "4g",
+        "env": {"CARGO_TARGET_DIR": "/cache/target"},
+        "caches": [
+            ("cargo-reg", "/usr/local/cargo/registry", False, "2G"),
+            ("cargo-target", "/cache/target", True, "8G"),
+        ],
+    },
+    "node": {
+        "image": os.environ.get("MVM_NODE_IMAGE", "docker.io/library/node:22-alpine"),
+        "memory": "2g",
+        "env": {"npm_config_cache": "/cache/npm"},
+        "caches": [
+            ("npm", "/cache/npm", True, "4G"),
+        ],
+    },
+}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mvm: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_sbin(tool: str) -> str:
+    for p in (f"/usr/sbin/{tool}", f"/sbin/{tool}", shutil.which(tool) or ""):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    die(f"required tool not found: {tool}")
+    return ""
+
+
+def cache_img_path(name: str) -> Path:
+    if not name or "/" in name or name in (".", ".."):
+        die(f"invalid cache name: {name!r}")
+    return CACHE_ROOT / f"{name}.img"
+
+
+def cache_lock_path(name: str) -> Path:
+    return CACHE_ROOT / f"{name}.lock"
+
+
+def ensure_cache_img(name: str, size: str = "4G") -> Path:
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    img = cache_img_path(name)
+    if img.exists():
+        return img
+    mkfs = find_sbin("mkfs.ext4")
+    print(f"mvm: creating sparse ext4 cache {img} ({size})", file=sys.stderr)
+    subprocess.run(["truncate", "-s", size, str(img)], check=True)
+    subprocess.run([mkfs, "-q", "-F", str(img)], check=True)
+    return img
+
+
+def dir_size_bytes(path: Path) -> int:
+    res = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True, check=True)
+    return int(res.stdout.split()[0])
+
+
+def cmd_cache(args: list[str]) -> int:
+    if not args or args[0] in ("-h", "--help"):
+        print(
+            "Usage:\n"
+            "  mvm cache ls\n"
+            "  mvm cache init <name> [size=4G]\n"
+            "  mvm cache import <name> <host-dir> [size=auto]\n"
+            "  mvm cache grow <name> <new-size>\n"
+            "  mvm cache rm <name>"
+        )
+        return 0
+
+    sub = args[0]
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if sub == "ls":
+        imgs = sorted(CACHE_ROOT.glob("*.img"))
+        if not imgs:
+            print(f"No cache images in {CACHE_ROOT}")
+            return 0
+        print(f"{'NAME':<18} {'USED':>8} {'VIRTUAL':>8}  PATH")
+        for img in imgs:
+            st = img.stat()
+            used_mb = (st.st_blocks * 512) / (1024 * 1024)
+            virt_mb = st.st_size / (1024 * 1024)
+            print(f"{img.stem:<18} {used_mb:7.0f}M {virt_mb:7.0f}M  {img}")
+        return 0
+
+    if sub == "init":
+        if len(args) < 2:
+            die("usage: mvm cache init <name> [size=4G]")
+        name = args[1]
+        size = args[2] if len(args) > 2 else "4G"
+        img = cache_img_path(name)
+        if img.exists():
+            die(f"cache already exists: {img}")
+        ensure_cache_img(name, size)
+        return 0
+
+    if sub == "import":
+        if len(args) < 3:
+            die("usage: mvm cache import <name> <host-dir> [size=auto]")
+        name = args[1]
+        src = Path(args[2]).expanduser().resolve()
+        if not src.is_dir():
+            die(f"not a directory: {src}")
+        img = cache_img_path(name)
+        if img.exists():
+            die(f"cache already exists: {img} (remove first with `mvm cache rm {name}`)")
+        if len(args) > 3:
+            size = args[3]
+        else:
+            sz_bytes = dir_size_bytes(src)
+            gb = max(2, int((sz_bytes * 2) // (1024**3)) + 1)
+            size = f"{gb}G"
+        mkfs = find_sbin("mkfs.ext4")
+        tmp_img = img.with_suffix(".img.tmp")
+        print(f"mvm: importing {src} -> {img} (virtual {size})...", file=sys.stderr)
+        try:
+            subprocess.run(["truncate", "-s", size, str(tmp_img)], check=True)
+            subprocess.run([mkfs, "-q", "-F", "-d", str(src), str(tmp_img)], check=True)
+            tmp_img.rename(img)
+        except Exception:
+            tmp_img.unlink(missing_ok=True)
+            raise
+        st = img.stat()
+        print(f"mvm: imported {name} ({(st.st_blocks * 512) // (1024 * 1024)} MiB on disk)", file=sys.stderr)
+        return 0
+
+    if sub == "grow":
+        if len(args) < 3:
+            die("usage: mvm cache grow <name> <new-size>")
+        name, new_size = args[1], args[2]
+        img = cache_img_path(name)
+        if not img.exists():
+            die(f"cache not found: {img}")
+        e2fsck = find_sbin("e2fsck")
+        resize2fs = find_sbin("resize2fs")
+        lock_fd = open(cache_lock_path(name), "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            subprocess.run(["truncate", "-s", new_size, str(img)], check=True)
+            r = subprocess.run([e2fsck, "-f", "-p", str(img)])
+            if r.returncode not in (0, 1):
+                die(f"e2fsck exited with {r.returncode}")
+            subprocess.run([resize2fs, str(img)], check=True)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        return 0
+
+    if sub == "rm":
+        if len(args) < 2:
+            die("usage: mvm cache rm <name>")
+        name = args[1]
+        img = cache_img_path(name)
+        lock = cache_lock_path(name)
+        if not img.exists():
+            die(f"cache not found: {img}")
+        img.unlink()
+        lock.unlink(missing_ok=True)
+        print(f"mvm: removed {img}", file=sys.stderr)
+        return 0
+
+    die(f"unknown cache subcommand: {sub}")
+    return 1
+
+
+def print_usage() -> None:
+    print(
+        "mvm — Run commands in ephemeral Podman+krun microVMs with locked ext4 caches\n"
+        "\n"
+        "Usage:\n"
+        "  mvm [options] -- <command...>\n"
+        "  mvm cache <ls|init|import|grow|rm> ...\n"
+        "\n"
+        "Profiles (pick image + caches + env automatically):\n"
+        "  --go                 golang:1.27-alpine + go-mod (ro offline / rw --net) + go-build\n"
+        "  --rust               rust:1.98-alpine (4g RAM) + cargo-reg (ro offline / rw --net) + cargo-target\n"
+        "  --node               node:22-alpine + npm (npm_config_cache)\n"
+        "\n"
+        "Options:\n"
+        "  -i, --image IMAGE    OCI image (overrides profile)\n"
+        "  --net                Enable network (default: offline --network=none)\n"
+        "  --rw                 Mount current dir read-write at /src (default: read-only)\n"
+        "  -o, --out DIR        Mount ./DIR read-write at /out (created if missing)\n"
+        "  -m, --mem SIZE       MicroVM RAM (default: 2g, or 4g for --rust)\n"
+        "  -c, --cache SPEC     Attach ext4 cache: NAME[:ro]:GUEST_PATH (repeatable)\n"
+        "  -t, --tmpfs SPEC     Mount guest tmpfs: GUEST_PATH[:SIZE] (e.g. /tmp/work:1g)\n"
+        "  -e, --env KEY=VAL    Pass env var into microVM (repeatable)\n"
+        "  -v, --volume SPEC    Extra podman -v mount (repeatable)\n"
+        "  --no-src             Do not mount current directory at /src\n"
+        "  --crun               Use regular crun container instead of krun (no ext4 loop mounts)\n"
+        "  -h, --help           Show this help\n"
+        "\n"
+        "Examples:\n"
+        "  mvm cache import go-mod ~/.cache/go-mod\n"
+        "  mvm cache import go-build ~/.cache/go-build\n"
+        "  mvm --net --go -- go mod download\n"
+        "  mvm --go -o build -- go build -trimpath -o /out/gateway ./cmd/gateway\n"
+        "  mvm --rust -o build -- cargo build --offline --release\n"
+    )
+
+
+def acquire_locks(specs: list[tuple[str, str, bool, str]]) -> list[tuple[object, str]]:
+    """Acquire flock in deterministic name order to prevent deadlocks."""
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    acquired = []
+    # Deduplicate by cache name; if any spec needs RW, lock EX.
+    by_name: dict[str, bool] = {}
+    for name, _mp, rw, _sz in specs:
+        by_name[name] = by_name.get(name, False) or rw
+
+    for name in sorted(by_name):
+        rw = by_name[name]
+        fd = open(cache_lock_path(name), "w")
+        mode = fcntl.LOCK_EX if rw else fcntl.LOCK_SH
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            kind = "exclusive" if rw else "shared"
+            print(f"mvm: waiting for {kind} lock on cache '{name}'...", file=sys.stderr)
+            fcntl.flock(fd, mode)
+        acquired.append((fd, name))
+    return acquired
+
+
+def release_locks(acquired: list[tuple[object, str]]) -> None:
+    for fd, _name in reversed(acquired):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print_usage()
+        return 0
+
+    if argv[0] == "cache":
+        return cmd_cache(argv[1:])
+
+    profile_name: str | None = None
+    image: str | None = None
+    net = False
+    rw_src = False
+    no_src = False
+    out_dir: str | None = None
+    memory: str | None = None
+    use_crun = False
+    extra_caches: list[tuple[str, str, bool, str]] = []
+    tmpfs_specs: list[tuple[str, str]] = []
+    env_vars: dict[str, str] = {}
+    extra_volumes: list[str] = []
+
+    i = 0
+    cmd: list[str] = []
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            cmd = argv[i + 1 :]
+            break
+        elif a in ("--go", "--rust", "--node"):
+            profile_name = a[2:]
+        elif a in ("-i", "--image"):
+            i += 1
+            image = argv[i]
+        elif a == "--net":
+            net = True
+        elif a == "--rw":
+            rw_src = True
+        elif a == "--no-src":
+            no_src = True
+        elif a in ("-o", "--out"):
+            i += 1
+            out_dir = argv[i]
+        elif a in ("-m", "--mem", "--memory"):
+            i += 1
+            memory = argv[i]
+        elif a == "--crun":
+            use_crun = True
+        elif a in ("-c", "--cache"):
+            i += 1
+            parts = argv[i].split(":")
+            if len(parts) == 2:
+                extra_caches.append((parts[0], parts[1], True, "4G"))
+            elif len(parts) == 3 and parts[1] in ("ro", "rw"):
+                extra_caches.append((parts[0], parts[2], parts[1] == "rw", "4G"))
+            else:
+                die(f"invalid --cache spec {argv[i]!r}; expected NAME[:ro|:rw]:GUEST_PATH")
+        elif a in ("-t", "--tmpfs"):
+            i += 1
+            parts = argv[i].split(":", 1)
+            mp = parts[0]
+            sz = parts[1] if len(parts) == 2 else "1g"
+            tmpfs_specs.append((mp, sz))
+        elif a in ("-e", "--env"):
+            i += 1
+            if "=" not in argv[i]:
+                k = argv[i]
+                if k in os.environ:
+                    env_vars[k] = os.environ[k]
+            else:
+                k, v = argv[i].split("=", 1)
+                env_vars[k] = v
+        elif a in ("-v", "--volume"):
+            i += 1
+            extra_volumes.append(argv[i])
+        else:
+            # Convenience: if user omits `--`, treat remaining args as command once image/profile is known
+            cmd = argv[i:]
+            break
+        i += 1
+
+    if not cmd:
+        die("no command given (use `mvm [options] -- <command...>`)")
+
+    caches: list[tuple[str, str, bool, str]] = []
+    merged_env: dict[str, str] = {}
+
+    if profile_name:
+        prof = PROFILES[profile_name]
+        image = image or prof["image"]
+        memory = memory or prof["memory"]
+        merged_env.update(prof["env"])
+        for cname, mp, rw_offline, default_sz in prof["caches"]:
+            rw = True if net else rw_offline
+            caches.append((cname, mp, rw, default_sz))
+
+    merged_env.update(env_vars)
+    caches.extend(extra_caches)
+    memory = memory or "2g"
+
+    if not image:
+        die("no image specified (use --go/--rust/--node or -i IMAGE)")
+
+    if use_crun and caches:
+        die("--crun cannot loop-mount ext4 cache images without privileges; omit --crun or --cache")
+
+    # Ensure cache images exist and acquire locks before launching microVM
+    for cname, _mp, _rw, default_sz in caches:
+        ensure_cache_img(cname, default_sz)
+
+    locks = acquire_locks(caches)
+    try:
+        podman_cmd = ["podman", "run", "--rm"]
+        if not use_crun:
+            podman_cmd += ["--runtime", "krun", "--memory", memory]
+        if not net:
+            podman_cmd += ["--network=none"]
+
+        cwd = Path.cwd()
+        if not no_src:
+            mode = "z" if rw_src else "ro,z"
+            podman_cmd += ["-v", f"{cwd}:/src:{mode}", "-w", "/src"]
+
+        if out_dir:
+            out_path = (cwd / out_dir).resolve()
+            out_path.mkdir(parents=True, exist_ok=True)
+            podman_cmd += ["-v", f"{out_path}:/out:z"]
+
+        for v in extra_volumes:
+            podman_cmd += ["-v", v]
+
+        for k, v in merged_env.items():
+            podman_cmd += ["-e", f"{k}={v}"]
+
+        # Bind-mount each ext4 cache image file into /run/mvm-imgs/<idx>.img
+        mount_lines: list[str] = []
+        umount_paths: list[str] = []
+
+        for idx, (cname, mp, rw, _sz) in enumerate(caches):
+            img = cache_img_path(cname)
+            host_mode = "z" if rw else "ro,z"
+            guest_img = f"/run/mvm-imgs/{idx}-{cname}.img"
+            podman_cmd += ["-v", f"{img}:{guest_img}:{host_mode}"]
+            loop_opts = "loop" if rw else "loop,ro"
+            mount_lines.append(
+                f"mkdir -p {shlex.quote(mp)} && mount -o {loop_opts} {shlex.quote(guest_img)} {shlex.quote(mp)}"
+            )
+            umount_paths.append(mp)
+
+        for mp, sz in tmpfs_specs:
+            mount_lines.append(
+                f"mkdir -p {shlex.quote(mp)} && mount -t tmpfs -o size={shlex.quote(sz)} tmpfs {shlex.quote(mp)}"
+            )
+            umount_paths.append(mp)
+
+        podman_cmd.append(image)
+
+        if mount_lines:
+            # Run mounts, trap clean unmount on exit, then execute user command.
+            umount_cmd = " ".join(shlex.quote(p) for p in reversed(umount_paths))
+            user_cmd = " ".join(shlex.quote(arg) for arg in cmd)
+            wrapper = (
+                "set -eu\n"
+                + "\n".join(mount_lines)
+                + f"\ncleanup() {{ umount {umount_cmd} 2>/dev/null || true; }}\n"
+                + "trap cleanup EXIT\n"
+                + f"{user_cmd}\n"
+            )
+            podman_cmd += ["sh", "-c", wrapper]
+        else:
+            podman_cmd += cmd
+
+        res = subprocess.run(podman_cmd)
+        return res.returncode
+    finally:
+        release_locks(locks)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

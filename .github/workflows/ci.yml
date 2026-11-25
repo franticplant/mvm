@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install e2fsprogs, zsh, man-db
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs zsh man-db
+
+      - name: Lint Python, completions, and man page
+        run: |
+          make lint
+          man --warnings -E UTF-8 -l man/mvm.1 >/dev/null
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Verify make install & uninstall into temp PREFIX
+        run: |
+          TMPPREFIX="$(mktemp -d)"
+          make install PREFIX="$TMPPREFIX"
+          test -x "$TMPPREFIX/bin/mvm"
+          test -f "$TMPPREFIX/share/man/man1/mvm.1"
+          test -f "$TMPPREFIX/share/bash-completion/completions/mvm"
+          make uninstall PREFIX="$TMPPREFIX"
+          test ! -e "$TMPPREFIX/bin/mvm"
+          rm -rf "$TMPPREFIX"
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
