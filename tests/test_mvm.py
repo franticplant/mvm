@@ -275,6 +275,14 @@ class EgressTests(Base):
         self.assertFalse(self.mvm.cache_img("c9").exists())           # no cache created
         self.assertFalse((self.mvm.STATE_ROOT / "runs").exists())     # no run record
 
+    def test_host_names_normalised_in_summary(self):
+        D = "CANONICAL-PROXY-DECISION"
+        lines = ['{"msg":"%s","id":"%d","requested_host":"%s","allow":true}' % (D, i, h)
+                 for i, h in enumerate(["PROXY.GOLANG.ORG:443", "proxy.golang.org.:443", "proxy.golang.org:443"])]
+        s = self.mvm.summarize(lines)
+        self.assertEqual(list(s["allowed"]), ["proxy.golang.org"])
+        self.assertEqual(s["allowed"]["proxy.golang.org"]["connections"], 3)
+
     def test_summarize_real_smokescreen_log_shapes(self):
         # Field shapes copied from a real Smokescreen v2 run (report mode, go mod download).
         D, C = "CANONICAL-PROXY-DECISION", "CANONICAL-PROXY-CN-CLOSE"

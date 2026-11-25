@@ -79,7 +79,9 @@ def free_port() -> int:
 
 
 def _host(requested: str) -> str:
-    return requested.rsplit(":", 1)[0] if requested.count(":") == 1 else requested
+    """host[:port] -> host, lower-cased, trailing dot dropped (PROXY.golang.org. == proxy.golang.org)."""
+    host = requested.rsplit(":", 1)[0] if requested.count(":") == 1 else requested
+    return host.lower().rstrip(".")
 
 
 def summarize(log_lines: list[str]) -> dict:

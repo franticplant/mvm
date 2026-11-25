@@ -81,6 +81,7 @@ make test-real      # + real microVM tests, including the egress escape test
 ## Caveats
 
 - podman's `--tmpfs` is ignored under krun; mvm hides directories with an empty read-only bind instead.
+- The egress allowlist is by host name, not port: an allowed host is reachable on any port (Smokescreen's ACL has no per-host port rule). Host loopback, link-local, private ranges and IP literals are refused (checked with real CONNECT probes).
 - Writable caches are single-writer: concurrent builds of the same ecosystem wait on the lock.
 - A failing build (non-zero exit, including failing tests) discards that run's build-cache writes; the next run rebuilds.
 - Rust path dependencies outside the project directory and npm workspaces with nested `node_modules` are not handled by `fetch` yet.
