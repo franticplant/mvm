@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import core
+from . import core, egress
 from .cache import cache_img, cache_meta, run_copies, try_exclusive
 from .core import DEFAULT_MASK, MvmError, die, find_sbin, load_config, now_iso, pinned, pins_path, read_json, resolve_digest, say, write_json_atomic
 from .ecos import ECOS, Eco, eco_caches
@@ -53,20 +53,24 @@ def image_for(cfg: dict, eco: Eco) -> str:
 def cmd_fetch(args: list[str]) -> int:
     root = Path.cwd().resolve()
     custom: list[str] = []
+    learn = "--learn" in args[: args.index("--") if "--" in args else len(args)]
+    if learn:
+        args = [a for i, a in enumerate(args) if not (a == "--learn" and ("--" not in args or i < args.index("--")))]
     if "--" in args:
         i = args.index("--")
         args, custom = args[:i], args[i + 1:]
         if not custom:
             die("missing command after --")
     if len(args) > 1 or (args and args[0] not in ECOS):
-        die(f"usage: mvm fetch [{'|'.join(ECOS)}] [-- CMD]")
+        die(f"usage: mvm fetch [{'|'.join(ECOS)}] [--learn] [-- CMD]")
     ecos = args or detect_ecos(root)
     if custom and len(ecos) != 1:
         die(f"found {', '.join(ecos) or 'no'} ecosystem(s) here; name one: mvm fetch {'|'.join(ECOS)} -- CMD")
     if not ecos:
         die("nothing to fetch: no go.mod, Cargo.toml or package.json here")
     cfg = load_config()
-    say("egress: open (allowlist proxy arrives in stage 2), observer: off")
+    if learn:
+        say("learn mode: egress is allowed but logged, nothing is committed or copied back")
     for name in ecos:
         eco = ECOS[name]
         with tempfile.TemporaryDirectory(prefix=f"mvm-fetch-{name}-") as tmp:
@@ -80,10 +84,13 @@ def cmd_fetch(args: list[str]) -> int:
             plan = Plan(kind="fetch", eco=name, image=image_for(cfg, eco),
                         memory=memory_for(cfg, name, eco.memory), cmd=cmd, src=tree, src_rw=True,
                         net=True, caches=eco_caches(eco, "fetch", root), env={**eco.env, **eco.fetch_env},
-                        project=root)
+                        project=root, learn=learn, allow=egress.allowlist(cfg, name))
             rc = execute(plan)
             if rc != 0:
                 return rc
+            if learn:
+                report_learned(name, plan.allow)
+                continue
             # Only dependency manifests ever flow back into the project.
             for rel in changed_manifests(root, tree, eco):
                 copy_back(tree, root, rel)
@@ -91,6 +98,21 @@ def cmd_fetch(args: list[str]) -> int:
     if "node" in ecos:
         say("node: install scripts were skipped; run them offline: mvm build node -- npm rebuild")
     return 0
+
+
+def report_learned(eco: str, allowed: list[str]) -> None:
+    """After a --learn fetch: which hosts were used beyond the allowlist."""
+    from .runtime import latest_record
+    rec = latest_record()
+    eg = rec.get("egress", {})
+    seen = sorted({*eg.get("allowed", {}), *eg.get("denied", {})})
+    extra = [h for h in eg.get("outside_allowlist", []) if h not in allowed]
+    if not extra:
+        say(f"{eco}: every host used is already allowed ({', '.join(seen) or 'none'})")
+        return
+    hosts = ", ".join(f'"{h}"' for h in extra)
+    say(f"{eco}: hosts outside the allowlist: {', '.join(extra)}")
+    say(f"to allow them, add to {core.CONFIG_PATH}:  [allow]  {eco} = [{hosts}]")
 
 
 def cmd_build(args: list[str]) -> int:
@@ -165,8 +187,15 @@ def cmd_status(args: list[str]) -> int:
         die("status takes no arguments")
     cfg_state = str(core.CONFIG_PATH) if core.CONFIG_PATH.exists() else f"{core.CONFIG_PATH} (absent, defaults)"
     print(f"config   {cfg_state}")
-    print("egress   open during fetch (stage 2 adds the allowlist proxy)")
+    sb = egress.smokescreen_bin()
+    if sb.is_file():
+        print(f"egress   fetch only, through the allowlist proxy ({sb})")
+    else:
+        print(f"egress   MISSING proxy {sb}: fetch refuses to run (make smokescreen)")
     print("observer off")
+    cfg = load_config()
+    for name in ECOS:
+        print(f"  allow {name:<5} {', '.join(egress.allowlist(cfg, name))}")
     print("\nimages")
     pins = read_json(pins_path(), {})
     for tag in sorted(pins):
@@ -191,8 +220,11 @@ def cmd_status(args: list[str]) -> int:
     for p in recs:
         r = read_json(p, {})
         cmd = " ".join(r.get("cmd", []))
+        eg = r.get("egress") if isinstance(r.get("egress"), dict) else {}
+        denied = eg.get("denied", {})
+        flag = f" DENIED {','.join(sorted(denied))}" if denied else ""
         print(f"  {r.get('id', p.stem):<24} {r.get('kind', '?'):<5} {str(r.get('eco') or '-'):<4} "
-              f"{str(r.get('result', 'running?')):<11} exit {str(r.get('exit', '-')):<4} {cmd[:60]}")
+              f"{str(r.get('result', 'running?')):<11} exit {str(r.get('exit', '-')):<4} {cmd[:50]}{flag}")
     if not recs:
         print("  (none)")
     return 0
@@ -268,8 +300,10 @@ def cmd_cache(args: list[str]) -> int:
 USAGE = """\
 mvm - run dev tooling in throwaway Podman+krun microVMs
 
-  mvm fetch [go|rust|node] [-- CMD]    download dependencies; with CMD, change them
-                                       (go get, cargo add, npm install ...)
+  mvm fetch [go|rust|node] [--learn] [-- CMD]
+                                       download dependencies; with CMD, change them
+                                       (go get, cargo add, npm install ...);
+                                       --learn: allow but log every host, commit nothing
   mvm build [go|rust|node] [-w DIR] [--it] -- CMD
                                        build offline against the fetched caches
   mvm run -i IMAGE [-w DIR] [--it] -- CMD
@@ -281,7 +315,8 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
   -w DIR   make ./DIR writable (the project is read-only otherwise)
   --it     interactive terminal
 
-fetch is the only command with network. It sees only the dependency manifests
+fetch is the only command with network, and its only way out is a per-run
+allowlist proxy (Smokescreen): no DNS, no direct connections. It sees only the dependency manifests
 (go.mod, Cargo.toml, package.json and their lockfiles), never your sources, and
 only changed manifests are copied back. npm install scripts are skipped by
 default (run them offline: mvm build node -- npm rebuild).

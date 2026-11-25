@@ -25,6 +25,7 @@ STATE_ROOT = Path(os.environ.get("MVM_STATE_DIR", HOME / ".local" / "state" / "m
 
 
 CONFIG_PATH = Path(os.environ.get("MVM_CONFIG", HOME / ".config" / "mvm" / "config.toml"))
+LIB_DIR = Path(os.environ.get("MVM_LIB_DIR", HOME / ".local" / "lib" / "mvm"))
 
 
 KEEP_RUNS = 200
@@ -66,9 +67,14 @@ def load_config() -> dict:
             cfg = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         die(f"{CONFIG_PATH}: {e}")
-    unknown = set(cfg) - {"mask", "images", "memory"}
+    unknown = set(cfg) - {"mask", "images", "memory", "allow"}
     if unknown:
-        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory)")
+        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory, allow)")
+    allow = cfg.get("allow", {})
+    if not isinstance(allow, dict) or not all(
+            k in ECOS and isinstance(v, list) and all(isinstance(h, str) and re.fullmatch(r"(\*\.)?[A-Za-z0-9.-]+", h) for h in v)
+            for k, v in allow.items()):
+        die(f"{CONFIG_PATH}: [allow] keys must be {sorted(ECOS)} with lists of host names")
     mask = cfg.get("mask", DEFAULT_MASK)
     if not isinstance(mask, list) or not all(isinstance(m, str) and m for m in mask):
         die(f"{CONFIG_PATH}: mask must be a list of non-empty strings")

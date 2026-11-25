@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import shlex
@@ -11,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import core
+from . import core, egress
 from .cache import Locks, cache_img, commit_copy, ensure_cache, make_run_copy
 from .core import KEEP_RUNS, now_iso, podman_out, say, write_json_atomic
 from .ecos import Cache
@@ -33,19 +34,27 @@ class Plan:
     interactive: bool = False
     project: Path | None = None
     src_rw: bool = False      # only the throwaway fetch tree is writable
+    learn: bool = False       # fetch --learn: proxy reports instead of enforcing; never commits
+    allow: list[str] = field(default_factory=list)      # egress allowlist for net runs
 
 
 def new_run_id() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
 
 
-def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Path) -> list[str]:
-    """Build the podman command. `mounts` maps cache name -> image file to attach."""
+def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Path,
+                net_args: list[str] | None = None) -> list[str]:
+    """Build the podman command. `mounts` maps cache name -> image file to attach.
+
+    A networked plan must come with `net_args` (the confined pasta network); there is
+    no unconfined network any more.
+    """
+    if plan.net and not net_args:
+        raise core.MvmError("networked run without egress confinement")
     argv = ["podman", "run", "--rm", "--runtime", "krun", "--memory", plan.memory,
             "--name", f"mvm-{run_id}", "--label", f"mvm.run={run_id}",
             "--label", f"mvm.pid={os.getpid()}"]
-    if not plan.net:
-        argv.append("--network=none")
+    argv += net_args if plan.net else ["--network=none"]
     if plan.interactive:
         argv.append("-it")
     if plan.src is not None:
@@ -110,6 +119,11 @@ def record_path(run_id: str) -> Path:
     return core.STATE_ROOT / "runs" / f"{run_id}.json"
 
 
+def latest_record() -> dict:
+    recs = sorted((core.STATE_ROOT / "runs").glob("*.json"))
+    return core.read_json(recs[-1], {}) if recs else {}
+
+
 def prune_records() -> None:
     recs = sorted((core.STATE_ROOT / "runs").glob("*.json"))
     for old in recs[:-KEEP_RUNS]:
@@ -122,15 +136,17 @@ def execute(plan: Plan) -> int:
     project = plan.project
     for c in plan.caches:
         ensure_cache(c, project if c.name.startswith("nm-") else None)
+    mode = ("learn" if plan.learn else "enforce") if plan.net else "none"
     rec = {"id": run_id, "kind": plan.kind, "eco": plan.eco, "image": plan.image,
-           "cmd": plan.cmd, "cwd": str(project or Path.cwd()),
-           "egress": "open" if plan.net else "none", "started_at": now_iso(),
+           "cmd": plan.cmd, "cwd": str(project or Path.cwd()), "started_at": now_iso(),
+           "egress": {"mode": mode, "allow": plan.allow if plan.net else []},
            "caches": {c.name: ("rw" if c.rw else "ro") for c in plan.caches}}
     write_json_atomic(record_path(run_id), rec)
 
     copies: dict[str, Path] = {}
     rc = 130
     result = "interrupted"
+    label = f"{plan.kind} {plan.eco}" if plan.eco else plan.kind
     try:
         with Locks(plan.caches), tempfile.TemporaryDirectory(prefix="mvm-empty-") as empty:
             mounts = {}
@@ -138,13 +154,25 @@ def execute(plan: Plan) -> int:
                 if c.rw and c.name not in copies:
                     copies[c.name] = make_run_copy(c.name, run_id)
                 mounts[c.name] = copies.get(c.name, cache_img(c.name))
-            argv = podman_argv(plan, run_id, mounts, Path(empty))
-            try:
-                rc = run_podman(argv)
-            except KeyboardInterrupt:
-                kill_container(run_id)
-                raise
-            if rc == 0:
+            with contextlib.ExitStack() as stack:
+                net_args = None
+                if plan.net:
+                    px = stack.enter_context(
+                        egress.Proxy(run_id, plan.allow, "report" if plan.learn else "enforce"))
+                    plan.env = {**plan.env, **egress.proxy_env(px.port)}
+                    net_args = egress.vm_network_args(px.port)
+                argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
+                try:
+                    rc = run_podman(argv)
+                except KeyboardInterrupt:
+                    kill_container(run_id)
+                    raise
+            if plan.net:                      # the proxy has stopped: its log is complete
+                rec["egress"].update(px.summary)
+                say(f"{label}: {egress.summary_line(px.summary)}")
+            if rc == 0 and plan.learn:
+                result = "learned"            # learning never changes caches
+            elif rc == 0:
                 rec["generations"] = {n: commit_copy(n, cp, run_id) for n, cp in copies.items()}
                 copies.clear()
                 result = "committed" if rec["generations"] else "ok"
@@ -156,7 +184,6 @@ def execute(plan: Plan) -> int:
         rec.update(exit=rc, result=result, finished_at=now_iso())
         write_json_atomic(record_path(run_id), rec)
         prune_records()
-        label = f"{plan.kind} {plan.eco}" if plan.eco else plan.kind
         if result == "committed":
             gens = ", ".join(f"{k} gen {v}" for k, v in rec["generations"].items())
             say(f"{label}: committed {gens} (run {run_id})")

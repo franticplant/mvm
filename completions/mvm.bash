@@ -17,7 +17,7 @@ _mvm_completion() {
         return
     fi
     case "${COMP_WORDS[1]}" in
-        fetch) ((COMP_CWORD == 2)) && mapfile -t COMPREPLY < <(compgen -W "go rust node --" -- "$cur") ;;
+        fetch) mapfile -t COMPREPLY < <(compgen -W "go rust node --learn --" -- "$cur") ;;
         build|run)
             case "$prev" in
                 -w) mapfile -t COMPREPLY < <(compgen -d -- "$cur") ;;
