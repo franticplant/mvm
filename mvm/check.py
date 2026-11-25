@@ -13,7 +13,7 @@ Proven with a real krun run: flatmap-stream@0.1.1 -> MAL-2025-20690, lodash@4.17
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -35,8 +35,24 @@ def before_fetch(cfg: dict) -> bool:
 
 
 def lockfiles(tree: Path, eco: str) -> list[str]:
-    names = set(LOCKFILES[eco])
-    return sorted(str(p.relative_to(tree)) for p in tree.rglob("*") if p.is_file() and p.name in names)
+    """Lockfiles under tree. The tree may have been writable inside a fetch VM, so
+    symlinks (files or directories) are never followed and only regular files count."""
+    from .project import _regular
+    names, out = set(LOCKFILES[eco]), []
+    for dirpath, dirnames, filenames in os.walk(tree, followlinks=False):
+        d = Path(dirpath)
+        dirnames[:] = sorted(n for n in dirnames if n not in core.SKIP_DIRS and not (d / n).is_symlink())
+        out += [str((d / f).relative_to(tree)) for f in filenames if f in names and _regular(d / f)]
+    return sorted(out)
+
+
+def _read_nofollow(path: Path, limit: int) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise core.MvmError(f"{path.name}: larger than {limit} bytes")
+    return data
 
 
 def parse(data: dict) -> dict:
@@ -81,9 +97,10 @@ def scan_tree(tree: Path, eco: str, cfg: dict, project: Path) -> dict:
         return {"skipped": "no lockfile", "packages": 0, "malicious": [], "vulnerable": []}
     with tempfile.TemporaryDirectory(prefix=f"mvm-check-{eco}-") as tmp:
         work = Path(tmp)
+        from .project import MAX_MANIFEST
         for rel in found:
             (work / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(tree / rel, work / rel)
+            (work / rel).write_bytes(_read_nofollow(tree / rel, MAX_MANIFEST))
         plan = runtime.Plan(kind="check", eco=eco, image=core.pinned(OSV_IMAGE), memory="1g",
                             cmd=["scan", "source", "--recursive", "--all-packages", "--no-resolve",
                                  "--no-call-analysis=all", "--format", "json",
@@ -95,8 +112,8 @@ def scan_tree(tree: Path, eco: str, cfg: dict, project: Path) -> dict:
             raise core.MvmError(f"dependency check failed (osv-scanner exit {rc}); "
                                 "set [check] before_fetch = false to fetch without it")
         try:
-            data = json.loads((work / OUT).read_text())
-        except (OSError, json.JSONDecodeError) as e:
+            data = json.loads(_read_nofollow(work / OUT, 256 * 1024 * 1024))
+        except (OSError, ValueError) as e:          # incl. JSONDecodeError, a symlink (ELOOP)
             raise core.MvmError(f"dependency check wrote no readable result: {e}") from e
     s = parse(data)
     s["lockfiles"] = found
@@ -149,6 +166,6 @@ def notify(url: str, title: str, message: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310 (scheme checked above)
             return 200 <= r.status < 300
-    except OSError as e:
+    except Exception as e:                    # noqa: BLE001 (HTTPException, ValueError, ...: never fatal)
         say(f"notify failed: {e}")
         return False

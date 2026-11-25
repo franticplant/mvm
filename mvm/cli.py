@@ -92,7 +92,9 @@ def cmd_fetch(args: list[str]) -> int:
                         net=True, caches=eco_caches(eco, "fetch", root), env={**eco.env, **eco.fetch_env},
                         project=root, learn=learn, allow=egress.allowlist(cfg, name),
                         observe=observer.enabled(cfg), notify=check.notify_url(cfg))
-            if checking and custom and not learn:
+            # Every non-learn fetch: a plain `cargo fetch` without Cargo.lock writes a new one.
+            # post_check costs nothing (no VM) when no lockfile changed.
+            if checking and not learn:
                 plan.gate = lambda tree=tree, name=name: post_check(root, tree, name, cfg)
             rc = execute(plan)
             if rc != 0:

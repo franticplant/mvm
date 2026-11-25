@@ -493,6 +493,22 @@ class CheckTests(Base):
         self.assertEqual(lf(self.proj, "rust"), ["Cargo.lock"])
         self.assertEqual(lf(self.proj, "go"), ["go.mod"])
 
+    def test_lockfiles_never_follow_symlinks(self):
+        """The fetch tree was writable in the VM: a planted symlink must not pull host files in."""
+        secret = Path(self.tmp.name) / "id_ed25519"
+        secret.write_text("PRIVATE")
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "package-lock.json").write_text("{}")
+        tree = Path(self.tmp.name) / "tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "package-lock.json").symlink_to(secret)
+        (tree / "linked").symlink_to(outside)
+        (tree / "sub" / "package-lock.json").write_text("{}")
+        self.assertEqual(self.mvm.check.lockfiles(tree, "node"), ["sub/package-lock.json"])
+        with self.assertRaises(OSError):                          # ELOOP: never read through a link
+            self.mvm.check._read_nofollow(tree / "package-lock.json", 100)
+
     def test_scan_without_lockfile_skips_without_a_vm(self):
         self.write("package.json", "{}")
         with mock.patch.object(sys.modules["mvm.runtime"], "execute") as ex:
@@ -564,6 +580,9 @@ class CheckTests(Base):
         self.assertFalse(self.mvm.check.notify("http://127.0.0.1:9/t", "t", "m"))   # refused: no raise
         self.assertFalse(self.mvm.check.notify("", "t", "m"))
         self.assertFalse(self.mvm.check.notify("file:///etc/passwd", "t", "m"))
+        import http.client
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.BadStatusLine("x")):
+            self.assertFalse(self.mvm.check.notify("https://n.example/t", "t", "m"))   # not an OSError
 
     def test_fetch_refused_when_lockfile_is_malicious(self):
         self.write("package.json", "{}")
@@ -581,6 +600,24 @@ class CheckTests(Base):
         ex.assert_not_called()                       # nothing downloaded
         rec = json.loads(next((self.mvm.STATE_ROOT / "checks").glob("*.json")).read_text())
         self.assertEqual(rec["ecos"]["node"]["malicious"][0]["package"], "flatmap-stream")
+
+    def test_plain_fetch_is_gated_too(self):
+        """cargo fetch without Cargo.lock writes one: the gate must run without a custom command."""
+        self.write("Cargo.toml", '[package]\nname = "r"\nversion = "0.1.0"\n')
+        plans = []
+        clean = {"skipped": "no lockfile", "packages": 0, "malicious": [], "vulnerable": []}
+        cwd = os.getcwd()
+        os.chdir(self.proj)
+        try:
+            with mock.patch.object(sys.modules["mvm.check"], "scan_project", return_value=clean), \
+                    mock.patch.object(sys.modules["mvm.cli"], "image_for", return_value="img"), \
+                    mock.patch.object(sys.modules["mvm.cli"], "execute", side_effect=lambda p: plans.append(p) or 0):
+                self.assertEqual(self.mvm.cmd_fetch([]), 0)
+                self.assertEqual(self.mvm.cmd_fetch(["--learn"]), 0)
+        finally:
+            os.chdir(cwd)
+        self.assertIsNotNone(plans[0].gate)
+        self.assertIsNone(plans[1].gate)                          # learn never commits
 
     def test_post_check_scans_only_a_changed_lockfile(self):
         self.write("package.json", "{}")
