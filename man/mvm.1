@@ -1,286 +1,144 @@
-.TH MVM 1 "2026-11-25" "mvm 0.1" "User Commands"
+.TH MVM 1 "2026-11-25" "mvm 0.2" "User Commands"
 .SH NAME
-mvm \- run dev tooling in ephemeral Podman+krun microVMs with locked ext4 caches
+mvm \- run dev tooling in throwaway Podman+krun microVMs
 .SH SYNOPSIS
-.B mvm
-.RI [ OPTIONS ]
+.B mvm fetch
+.RB [ go | rust | node ]
+.RB [ \-\-
+.IR CMD ...]
+.br
+.B mvm build
+.RB [ go | rust | node ]
+.RB [ \-w
+.IR DIR ]
+.RB [ \-\-it ]
 .B \-\-
-.I COMMAND
-.RI [ ARGS ...]
+.IR CMD ...
+.br
+.B mvm run \-i
+.I IMAGE
+.RB [ \-w
+.IR DIR ]
+.RB [ \-\-it ]
+.B \-\-
+.IR CMD ...
+.br
+.B mvm status
+.br
+.B mvm update
 .br
 .B mvm cache
-.I SUBCOMMAND
-.RI [ ARGS ...]
+.BR rm " NAME | " grow " NAME SIZE | " gc
 .SH DESCRIPTION
 .B mvm
-runs build tools, package managers, and untrusted scripts inside an ephemeral
-hardware-virtualized microVM via
-.BR podman (1)
+runs package managers, compilers and tests inside a hardware-virtualized
+microVM
+.RB ( podman (1)
 with
-.B \-\-runtime krun
-(zero host privileges, no host namespaces).
+.BR "\-\-runtime krun" ),
+with no host privileges.
 .PP
-By default:
-.IP \(bu 2
-Networking is disabled
-.RB ( \-\-network=none ).
-Pass
-.B \-\-net
-only when fetching dependencies.
-.IP \(bu 2
-The current working directory is bind-mounted read-only at
-.I /src
-with working directory
-.IR /src .
-Pass
-.B \-\-rw
-to mount it read-write, or
-.B \-o DIR
-to mount
-.I ./DIR
-read-write at
-.IR /out .
-.IP \(bu 2
-Named sparse ext4 cache images under
-.I ~/.cache/mvm/*.img
-are loop-mounted inside the guest kernel and cleanly unmounted on exit.
-This keeps compiler metadata churn off
-.B virtio-fs
-and reduces SELinux
-.B :z
-relabeling to a single inode per cache image.
-.IP \(bu 2
-Every cache image is automatically protected with
-.BR flock (2)
-on the host: shared lock
-.RB ( LOCK_SH )
-for read-only mounts and exclusive lock
-.RB ( LOCK_EX )
-for read-write mounts.
-.SH PROFILES
-Profiles select a default OCI image, memory limit, environment variables, and
-ext4 cache images automatically.
-.TP
-.B \-\-go
-Uses
-.I docker.io/library/golang:1.27-alpine
-(2g RAM,
-.BR CGO_ENABLED=0 ),
-mounts
-.I go-mod
-at
-.I /cache/go-mod
-(read-only offline, read-write with
-.BR \-\-net ),
-and
-.I go-build
-at
-.I /cache/go-build
-(read-write).
-.TP
-.B \-\-rust
-Uses
-.I docker.io/library/rust:1.98-alpine
-(4g RAM,
-.BR CARGO_TARGET_DIR=/cache/target ),
-mounts
-.I cargo-reg
-at
-.I /usr/local/cargo/registry
-(read-only offline, read-write with
-.BR \-\-net ),
-and
-.I cargo-target
-at
-.I /cache/target
-(read-write).
-.TP
-.B \-\-node
-Uses
-.I docker.io/library/node:22-alpine
-(2g RAM,
-.BR npm_config_cache=/cache/npm ),
-mounts
-.I npm
-at
-.I /cache/npm
-(read-write).
+.B fetch
+is the only command with network. It mounts a throwaway copy of the
+dependency manifests only (go.mod, go.sum, go.work, Cargo.toml, Cargo.lock,
+package.json, package\-lock.json; Cargo target files as empty stubs), never the
+sources. Without
+.I CMD
+it runs
+.BR "go mod download" ,
+.BR "cargo fetch" " (\-\-locked when Cargo.lock exists)" " or"
+.BR "npm ci \-\-ignore\-scripts \-\-no\-audit \-\-no\-fund"
+for every ecosystem found in the current directory. With
+.I CMD
+it runs that command instead, to change dependencies
+.RB ( "go get" ", " "cargo add" ", " "npm install" ).
+Manifests that changed are copied back into the project and listed.
+.PP
+.B build
+runs offline in the current project, mounted read\-only at
+.IR /src ,
+with the ecosystem's caches: dependency caches read\-only, build caches and the
+project's node_modules writable. The ecosystem is detected from the current
+directory unless named.
+.B run
+does the same for any image, without caches.
+.PP
+In build and run, files and directories matching the mask list (default:
+.IR ".git .env .env.* .envrc .npmrc .netrc .pypirc *.pem *.key id_rsa* id_ecdsa* id_ed25519*" )
+are hidden: directories appear empty, files appear empty.
 .SH OPTIONS
 .TP
-.BR \-i ", " \-\-image " " \fIIMAGE\fR
-OCI container image to run (overrides profile default).
-.TP
-.B \-\-net
-Enable networking inside the microVM (default is
-.BR \-\-network=none ).
-Also upgrades profile dependency caches
-.RI ( go-mod ", " cargo-reg )
-from read-only to read-write.
-.TP
-.B \-\-rw
-Mount the current directory read-write at
-.I /src
-instead of read-only.
-.TP
-.BR \-o ", " \-\-out " " \fIDIR\fR
-Mount
+.BI \-w " DIR"
+Make
 .I ./DIR
-read-write at
-.I /out
-(creating it on the host if needed) while keeping
-.I /src
-read-only.
+writable (created if missing; must be inside the project). Repeatable.
 .TP
-.BR \-m ", " \-\-mem " " \fISIZE\fR
-MicroVM RAM limit (default:
-.BR 2g ,
-or
-.B 4g
-for
-.BR \-\-rust ).
+.B \-\-it
+Interactive terminal.
 .TP
-.BR \-c ", " \-\-cache " " \fINAME\fR[\fB:ro\fR|\fB:rw\fR]\fB:\fIGUEST_PATH\fR
-Attach a named ext4 cache image from
-.I ~/.cache/mvm/NAME.img
-and loop-mount it at
-.I GUEST_PATH
-inside the microVM. Repeatable.
+.BI \-i " IMAGE"
+Image for
+.BR run .
+.SH CACHES AND COMMIT-ON-CLEAN
+Caches are sparse ext4 image files in
+.IR ~/.cache/mvm ,
+loop\-mounted inside the guest:
+go\-mod, go\-build, cargo\-reg, cargo\-git, cargo\-target, npm, and one
+nm\-<project>\-<hash> per node project.
+A writable cache is reflink\-copied for the run and replaces the cache
+atomically only when the command exits 0. Failure, interruption or a crash
+leaves the cache unchanged. Each commit increments the cache's generation.
+Readers take a shared
+.BR flock (2),
+the writer an exclusive one.
 .TP
-.BR \-t ", " \-\-tmpfs " " \fIGUEST_PATH\fR[\fB:\fISIZE\fR]
-Mount an in-VM
-.B tmpfs
-at
-.I GUEST_PATH
-(default size
-.BR 1g ).
-Repeatable.
+.B mvm cache gc
+Remove leftover run copies, kill microVMs whose mvm process died, drop
+node_modules caches of deleted projects.
 .TP
-.BR \-e ", " \-\-env " " \fIKEY\fR[\fB=\fIVAL\fR]
-Pass an environment variable into the microVM. Repeatable.
+.BI "mvm cache grow " "NAME SIZE"
+Grow a cache image (refused while in use).
 .TP
-.BR \-v ", " \-\-volume " " \fISPEC\fR
-Pass an extra
-.B podman \-v
-bind mount specification. Repeatable.
-.TP
-.B \-\-no-src
-Do not mount the current working directory at
-.IR /src .
-.TP
-.B \-\-crun
-Fall back to a standard
-.B crun
-container instead of
-.B krun
-(incompatible with
-.BR \-\-cache ).
-.TP
-.BR \-h ", " \-\-help
-Show usage summary and exit.
-.SH CACHE MANAGEMENT
-.TP
-.B mvm cache ls
-List cache images under
-.I ~/.cache/mvm
-with actual disk usage and virtual size.
-.TP
-.B mvm cache init \fINAME\fR [\fISIZE\fR]
-Create a new empty sparse ext4 cache image (default virtual size:
-.BR 4G ).
-.TP
-.B mvm cache import \fINAME\fR \fIHOST_DIR\fR [\fISIZE\fR]
-Populate a new sparse ext4 cache image from an existing host directory using
-unprivileged
-.BR mkfs.ext4 (8)
-.BR \-d .
-If
-.I SIZE
-is omitted, defaults to
-.IR max(2G,\ 2\ *\ dir_size) .
-.TP
-.B mvm cache grow \fINAME\fR \fINEW_SIZE\fR
-Expand a sparse ext4 cache image under an exclusive lock using
-.BR truncate (1),
-.BR e2fsck (8),
-and
-.BR resize2fs (8).
-.TP
-.B mvm cache rm \fINAME\fR
-Remove a cache image and its lockfile.
-.SH EXAMPLES
-.PP
-Import existing host Go and Cargo caches:
-.RS
-.EX
-mvm cache import go-mod ~/.cache/go-mod 2G
-mvm cache import go-build ~/.cache/go-build 5G
-mvm cache import cargo-reg ~/.cache/cargo 2G
-.EE
-.RE
-.PP
-Fetch dependencies with network, then build offline into
-.IR ./build :
-.RS
-.EX
-mvm --net --go -- go mod download
-mvm --go -o build -- go build -trimpath -o /out/gateway ./cmd/gateway
-.EE
-.RE
-.PP
-Offline Rust release build:
-.RS
-.EX
-mvm --rust -o build -- cargo build --offline --release
-.EE
-.RE
-.PP
-Run a one-off offline command with in-VM tmpfs scratch:
-.RS
-.EX
-mvm -i docker.io/library/alpine:latest -t /tmp/work:1g -- sh -c 'df -h /tmp/work'
-.EE
-.RE
-.SH ENVIRONMENT
-.TP
-.B MVM_CACHE_DIR
-Override the cache image directory (default:
-.IR ~/.cache/mvm ).
-.TP
-.B MVM_GO_IMAGE\fR, \fBMVM_RUST_IMAGE\fR, \fBMVM_NODE_IMAGE
-Override default OCI images for built-in profiles.
+.BI "mvm cache rm " NAME
+Delete a cache image (refused while in use).
+.SH IMAGES
+The first use of an image tag pins it to its digest in
+.IR ~/.local/state/mvm/pins.json ;
+later runs use the digest.
+.B mvm update
+re\-pulls every pinned tag and reports changes.
 .SH FILES
 .TP
-.I ~/.local/bin/mvm
-Executable script.
+.I ~/.config/mvm/config.toml
+Optional:
+.B mask
+(list),
+.B [images]
+(go, rust, node),
+.B [memory]
+(go, rust, node, run).
 .TP
-.I ~/.cache/mvm/*.img
-Sparse ext4 cache images.
-.TP
-.I ~/.cache/mvm/*.lock
-Host
-.BR flock (2)
-lockfiles for coordinating concurrent microVMs.
+.I ~/.local/state/mvm/runs/
+One JSON record per run (last 200).
+.SH ENVIRONMENT
+.BR MVM_CACHE_DIR ", " MVM_STATE_DIR ", " MVM_CONFIG
+override the paths above.
+.SH EXIT STATUS
+The command's exit status; 2 for usage errors; 130 when interrupted.
+.SH EXAMPLES
+.nf
+mvm fetch
+mvm fetch go \-\- go get golang.org/x/net@latest
+mvm fetch rust \-\- cargo generate\-lockfile
+mvm build \-w build \-\- go build \-o build/app ./cmd/app
+mvm build node \-\- npm rebuild
+mvm run \-i docker.io/library/alpine:3.24 \-\- uname \-a
+.fi
 .SH CAVEATS
-.IP \(bu 2
-Writable ext4 cache images are single-writer; concurrent runs wait automatically
-on
-.BR flock (2).
-Read-only caches
-.RB ( :ro )
-can be shared concurrently.
-.IP \(bu 2
-Inside
-.B krun \-\-network=none
-some loopback socket tests may behave differently than under
-.BR crun .
-Use
-.B \-\-crun
-(without ext4 cache images) or regular
-.B podman run --rm --network=none
-if a unit test hits a
-.B krun
-networking quirk.
+podman's
+.B \-\-tmpfs
+is ignored under krun. Egress during fetch is not yet restricted; see
+.BR "mvm status" .
 .SH SEE ALSO
-.BR podman (1),
-.BR mkfs.ext4 (8),
+.BR podman\-run (1),
 .BR flock (2)
