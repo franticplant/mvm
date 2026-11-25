@@ -74,7 +74,7 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 ```bash
 sudo dnf install podman crun-krun e2fsprogs
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
-make smokescreen    # build the pinned egress proxy offline with mvm; fetch refuses without it
+make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
 make test           # unit tests, no KVM needed
 make test-real      # + real microVM tests, including the egress escape test
 ```
@@ -82,7 +82,7 @@ make test-real      # + real microVM tests, including the egress escape test
 ## Caveats
 
 - podman's `--tmpfs` is ignored under krun; mvm hides directories with an empty read-only bind instead.
-- The egress allowlist is by host name, not port: an allowed host is reachable on any port (Smokescreen's ACL has no per-host port rule). Host loopback, link-local, private ranges and IP literals are refused (checked with real CONNECT probes).
+- Ports: Smokescreen's ACL is host-only, so the proxy runs in a pod whose network namespace has an nftables egress filter (loaded by a one-shot `NET_ADMIN` container; Smokescreen itself has no capabilities): only TCP 443 out, plus DNS to the pod's resolver. An allowed host on any other port is refused, recorded as denied, and holds the run. Host loopback, link-local, private and CGNAT ranges and IP literals are refused by Smokescreen (checked with real CONNECT probes).
 - Writable caches are single-writer: concurrent builds of the same ecosystem wait on the lock.
 - A failing build (non-zero exit, including failing tests) discards that run's build-cache writes; the next run rebuilds.
 - Rust path dependencies outside the project directory and npm workspaces with nested `node_modules` are not handled by `fetch` yet.

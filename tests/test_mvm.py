@@ -309,11 +309,63 @@ class EgressTests(Base):
         px = self.mvm.Proxy("RID", ["a.org"], "enforce")
         stopped = []
         with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="img@sha256:x"), \
+                mock.patch.object(sys.modules["mvm.egress"], "firewall_image_present", return_value=True), \
                 mock.patch.object(px, "_start", side_effect=KeyboardInterrupt), \
                 mock.patch.object(px, "_stop", side_effect=lambda: stopped.append(1) or []):
             with self.assertRaises(KeyboardInterrupt):
                 px.__enter__()
         self.assertEqual(stopped, [1])
+
+    def test_port_filter_rules(self):
+        fw = self.mvm.FIREWALL_SH
+        self.assertIn("policy drop;", fw)
+        self.assertIn("tcp dport 443 accept", fw)
+        self.assertIn("th dport 53 accept", fw)            # DNS only to the pod's resolver
+        self.assertNotIn("dport 80", fw)
+        self.assertIn("table inet", fw)                     # IPv4 and IPv6
+
+    def _start_with(self, fw_stdout, fw_rc=0):
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
+        self.mvm.LIB_DIR.mkdir(exist_ok=True)
+        (self.mvm.LIB_DIR / "smokescreen").write_text("")
+        calls = []
+        def fake_run(argv, *a, **k):
+            calls.append(argv)
+            out = fw_stdout if "/firewall.sh" in argv else ""
+            return subprocess.CompletedProcess(argv, fw_rc if "/firewall.sh" in argv else 0, out, "")
+        px = self.mvm.Proxy("RID", ["a.org"], "enforce")
+        with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="img@sha256:x"), \
+                mock.patch.object(sys.modules["mvm.egress"], "firewall_image_present", return_value=True), \
+                mock.patch("subprocess.run", side_effect=fake_run), \
+                mock.patch.object(px, "_wait_ready"):
+            try:
+                px.__enter__()
+            finally:
+                pass
+        return calls
+
+    def test_proxy_pod_order_firewall_before_smokescreen(self):
+        calls = self._start_with("MVM_EGRESS_FIREWALL_LOADED\n")
+        kinds = [c[1:3] for c in calls[:3]]
+        self.assertEqual(kinds[0], ["pod", "create"])
+        self.assertIn("--cap-add=NET_ADMIN", calls[1])           # only the one-shot firewall
+        self.assertIn("/smokescreen", calls[2])
+        self.assertIn("--cap-drop=all", calls[2])
+        self.assertNotIn("--cap-add=NET_ADMIN", calls[2])        # proxy runs with no capabilities
+
+    def test_proxy_refuses_when_firewall_does_not_load(self):
+        with self.assertRaises(self.mvm.MvmError):
+            self._start_with("", fw_rc=1)
+
+    def test_non_443_port_counts_as_denied(self):
+        D = "CANONICAL-PROXY-DECISION"
+        lines = ['{"msg":"%s","id":"1","requested_host":"proxy.golang.org:22","allow":true}' % D,
+                 '{"msg":"%s","id":"2","requested_host":"proxy.golang.org:443","allow":true}' % D,
+                 '{"msg":"%s","id":"3","requested_host":"[2001:db8::1]:8443","allow":true}' % D]
+        s = self.mvm.summarize(lines)
+        self.assertEqual(s["allowed"]["proxy.golang.org"]["connections"], 1)
+        self.assertEqual(s["denied"]["proxy.golang.org"]["reason"], "port 22 blocked (443 only)")
+        self.assertIn("2001:db8::1", s["denied"])
 
     def test_summarize_real_smokescreen_log_shapes(self):
         # Field shapes copied from a real Smokescreen v2 run (report mode, go mod download).
@@ -558,7 +610,8 @@ class RealTests(unittest.TestCase):
             'echo "direct=$(nc -w 3 1.1.1.1 443 </dev/null >/dev/null 2>&1 && echo OPEN || echo closed)"; '
             'echo "dns=$(nslookup -timeout=2 example.com 169.254.1.1 2>&1 | grep -c "Address: [0-9]")"; '
             'echo "unlisted=$(conn example.com)"; '
-            'echo "allowed=$(conn proxy.golang.org)"'
+            'echo "allowed=$(conn proxy.golang.org)"; '
+            'echo "allowed_port22=$(printf "CONNECT proxy.golang.org:22 HTTP/1.1\\r\\n\\r\\n" | nc -w 8 127.0.0.1 $P | head -1)"'
         )
         r = self.mvm("fetch", "go", "--", "sh", "-c", probe)
         # The probe itself tried an unlisted host, so the run is held (exit 3), not committed.
@@ -567,6 +620,8 @@ class RealTests(unittest.TestCase):
         self.assertIn("dns=0", r.stdout)
         self.assertRegex(r.stdout, r"unlisted=HTTP/1\.[01] 40[37]")
         self.assertRegex(r.stdout, r"allowed=HTTP/1\.[01] 200")
+        self.assertRegex(r.stdout, r"allowed_port22=HTTP/1\.[01] 50[24]")    # kernel filter: 443 only
+        self.assertNotIn("allowed_port22=HTTP/1.0 200", r.stdout)
         recs = sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))
         rec = json.loads(recs[-1].read_text())
         self.assertEqual(rec["egress"]["mode"], "enforce")

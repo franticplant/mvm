@@ -56,7 +56,8 @@ it runs that command instead, to change dependencies
 Manifests that changed are copied back into the project and listed.
 .PP
 The fetch VM has no direct network. Its only way out is TCP to one
-host\-loopback port, where a per\-run Smokescreen proxy allows only the
+host\-loopback port, where a per\-run Smokescreen proxy (in a pod whose
+kernel egress filter allows only TCP 443) allows only the
 ecosystem's registries (plus
 .B [allow]
 from the config); DNS, other TCP, UDP, ICMP and IPv6 are closed. Each

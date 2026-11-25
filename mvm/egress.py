@@ -26,8 +26,34 @@ DEFAULT_ALLOW = {
     "node": ["registry.npmjs.org"],
 }
 PROXY_IMAGE = "docker.io/library/alpine:3.24"
+# Built by `make smokescreen` from the pinned alpine plus nftables; loads FIREWALL_SH.
+FIREWALL_IMAGE = "localhost/mvm-egress-fw:1"
+# Smokescreen allowlists host names but cannot restrict ports, so the proxy's own network
+# namespace gets a kernel egress filter: only TCP 443 out, plus DNS to its resolver.
+FIREWALL_SH = r"""set -eu
+NS=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+nft -f - <<NFT
+table inet mvm_egress {
+  chain out {
+    type filter hook output priority 0; policy drop;
+    oifname "lo" accept
+    ct state established,related accept
+    ip daddr $NS meta l4proto { tcp, udp } th dport 53 accept
+    tcp dport 443 accept
+    meta l4proto tcp reject with tcp reset
+    reject
+  }
+}
+NFT
+nft list table inet mvm_egress | grep -q 'policy drop'
+echo MVM_EGRESS_FIREWALL_LOADED
+"""
 PROXY_PORT_IN_CONTAINER = 4750
 READY_TIMEOUT = 15.0
+
+
+def firewall_image_present() -> bool:
+    return subprocess.run(["podman", "image", "exists", FIREWALL_IMAGE]).returncode == 0
 
 
 def smokescreen_bin() -> Path:
@@ -88,6 +114,13 @@ def _host(requested: str) -> str:
     return host.lower().rstrip(".") or "(unknown)"
 
 
+def _port(requested: str) -> str:
+    if requested.startswith("["):
+        rest = requested.split("]", 1)[1] if "]" in requested else ""
+        return rest[1:] if rest.startswith(":") else ""
+    return requested.rsplit(":", 1)[1] if requested.count(":") == 1 else ""
+
+
 def summarize(log_lines: list[str]) -> dict:
     """Per-host decisions and bytes from Smokescreen's JSON log.
 
@@ -114,8 +147,14 @@ def summarize(log_lines: list[str]) -> dict:
     denied: dict[str, dict] = {}
     outside: set[str] = set()
     for d in decisions:
-        host = _host(d.get("requested_host") or "")
+        requested = d.get("requested_host") or ""
+        host = _host(requested)
         ok = bool(d.get("allow"))
+        port = _port(requested)
+        if ok and port not in ("", "443"):
+            # Smokescreen's ACL is host-only; the pod's kernel filter blocks every port but 443.
+            ok = False
+            d = {**d, "decision_reason": f"port {port} blocked (443 only)"}
         e = (allowed if ok else denied).setdefault(host, {"connections": 0, "bytes_in": 0, "bytes_out": 0})
         e["connections"] += 1
         c = closes.get(d.get("id") or "", {})
@@ -149,7 +188,9 @@ def summary_line(s: dict) -> str:
 
 
 class Proxy:
-    """One Smokescreen container for one run, on a random host-loopback port."""
+    """One proxy pod per run on a random host-loopback port: a one-shot NET_ADMIN
+    container loads the port filter (FIREWALL_SH) into the pod's network namespace,
+    then Smokescreen runs in the same pod with no capabilities at all."""
 
     def __init__(self, run_id: str, hosts: list[str], action: str):
         self.run_id = run_id
@@ -166,11 +207,15 @@ class Proxy:
         if not binary.is_file():
             raise core.MvmError(f"egress proxy missing: {binary} (run `make smokescreen` in the mvm repo); "
                                 "fetch refuses to run without it")
+        if not firewall_image_present():
+            raise core.MvmError(f"egress firewall image missing: {FIREWALL_IMAGE} (run `make smokescreen` in "
+                                "the mvm repo); fetch refuses to run without it")
         image = core.pinned(PROXY_IMAGE)
         self._dir = tempfile.TemporaryDirectory(prefix="mvm-proxy-")
         cfg = Path(self._dir.name)
         (cfg / "acl.yaml").write_text(acl_yaml(self.hosts, self.action))
         (cfg / "config.yaml").write_text(CONFIG_YAML)
+        (cfg / "firewall.sh").write_text(FIREWALL_SH)
         self.port = free_port()
         try:
             self._start(binary, image, cfg)
@@ -180,14 +225,23 @@ class Proxy:
         return self
 
     def _start(self, binary: Path, image: str, cfg: Path) -> None:
-        argv = ["podman", "run", "-d", "--rm", "--name", self.name,
-                "--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}",
+        labels = ["--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}"]
+        subprocess.run(["podman", "pod", "create", "--name", self.name, *labels,
+                        "-p", f"127.0.0.1:{self.port}:{PROXY_PORT_IN_CONTAINER}"],
+                       check=True, stdout=subprocess.DEVNULL)
+        fw = subprocess.run(["podman", "run", "--rm", "--pod", self.name, *labels,
+                             "--cap-drop=all", "--cap-add=NET_ADMIN", "--read-only",
+                             "-v", f"{cfg}/firewall.sh:/firewall.sh:ro,z",
+                             FIREWALL_IMAGE, "sh", "/firewall.sh"],
+                            capture_output=True, text=True)
+        if fw.returncode != 0 or "MVM_EGRESS_FIREWALL_LOADED" not in fw.stdout:
+            raise core.MvmError(f"egress port filter failed to load: {(fw.stderr or fw.stdout).strip()[:300]}")
+        argv = ["podman", "run", "-d", "--pod", self.name, "--name", f"{self.name}-smokescreen", *labels,
                 "--read-only", "--cap-drop=all", "--security-opt", "no-new-privileges",
-                "-p", f"127.0.0.1:{self.port}:{PROXY_PORT_IN_CONTAINER}",
                 "-v", f"{binary}:/smokescreen:ro,z", "-v", f"{cfg}:/cfg:ro,z",
                 image, "/smokescreen", "--config-file", "/cfg/config.yaml",
-                # 0.0.0.0 is inside the container's own netns; the host side is published
-                # only on 127.0.0.1 (the -p above), so nothing else can reach the proxy.
+                # 0.0.0.0 is inside the pod's own netns; the host side is published
+                # only on 127.0.0.1 (pod create -p above), so nothing else can reach it.
                 "--listen-ip", "0.0.0.0",  # noqa: S104
                 "--listen-port", str(PROXY_PORT_IN_CONTAINER)]
         subprocess.run(argv, check=True, stdout=subprocess.DEVNULL)
@@ -204,11 +258,12 @@ class Proxy:
         raise core.MvmError(f"egress proxy did not start on 127.0.0.1:{self.port}")
 
     def _stop(self) -> list[str]:
-        state = subprocess.run(["podman", "container", "inspect", "-f", "{{.State.Running}}", self.name],
+        sm = f"{self.name}-smokescreen"
+        state = subprocess.run(["podman", "container", "inspect", "-f", "{{.State.Running}}", sm],
                                capture_output=True, text=True)
-        logs = subprocess.run(["podman", "logs", self.name], capture_output=True, text=True)
+        logs = subprocess.run(["podman", "logs", sm], capture_output=True, text=True)
         self.healthy = state.stdout.strip() == "true" and logs.returncode == 0
-        subprocess.run(["podman", "stop", "-t", "2", self.name],
+        subprocess.run(["podman", "pod", "rm", "-f", "-t", "2", self.name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if self._dir:
             self._dir.cleanup()

@@ -51,4 +51,5 @@ smokescreen:
 	cd "$(SMOKESCREEN_SRC)" && "$(BINDIR)/mvm" build go -w out -- go build -mod=vendor -trimpath -o out/smokescreen .
 	install -d "$(LIBDIR)"
 	install -m 0755 "$(SMOKESCREEN_SRC)/out/smokescreen" "$(LIBDIR)/smokescreen"
-	@echo "Installed smokescreen $(SMOKESCREEN_REV) into $(LIBDIR)"
+	podman build -q -t localhost/mvm-egress-fw:1 -f egress/Containerfile.firewall egress >/dev/null
+	@echo "Installed smokescreen $(SMOKESCREEN_REV) into $(LIBDIR) and built localhost/mvm-egress-fw:1"

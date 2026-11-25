@@ -113,6 +113,17 @@ def reap_orphans() -> list[str]:
         if not Path(f"/proc/{pid}").exists():
             subprocess.run(["podman", "kill", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             reaped.append(name)
+    # Egress proxy pods (pod + firewall + Smokescreen) carry the same labels.
+    try:
+        pods = podman_out(["pod", "ps", "--filter", "label=mvm.run",
+                           "--format", '{{.Name}} {{index .Labels "mvm.pid"}}'])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pods = ""
+    for line in pods.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and not Path(f"/proc/{parts[1]}").exists():
+            subprocess.run(["podman", "pod", "rm", "-f", parts[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            reaped.append(parts[0])
     return reaped
 
 
