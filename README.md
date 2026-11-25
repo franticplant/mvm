@@ -21,7 +21,9 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 - **Changing dependencies** is a fetch with a command: `mvm fetch go -- go get golang.org/x/net@latest`, `mvm fetch rust -- cargo generate-lockfile`, `mvm fetch node -- npm install --ignore-scripts left-pad`. Only manifest/lockfile changes flow back, and mvm lists them.
 - **Commit-on-clean.** Every writable cache is a reflink copy for the duration of the run and replaces the cache atomically only on exit 0. A failure, Ctrl-C, crash or `kill -9` leaves the cache exactly as it was.
 - **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed.
-- **Egress is open during fetch for now.** The allowlist proxy and traffic observer are the next stages; `mvm status` says what is active.
+- **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
+- **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
+- **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.
 
 ## State
 
@@ -48,7 +50,12 @@ go = "docker.io/library/golang:1.27-alpine"
 [memory]
 rust = "6g"
 run = "1g"
+
+[allow]                # extra hosts for fetch, on top of the built-in registries
+go = ["github.com", "codeload.github.com"]
 ```
+
+Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`; rust `index.crates.io`, `static.crates.io`; node `registry.npmjs.org`.
 
 ## For AI coding agents
 
@@ -66,14 +73,16 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 
 ```bash
 sudo dnf install podman crun-krun e2fsprogs
-make install        # ~/.local/bin/mvm, man page, bash/zsh completions
+make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
+make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
 make test           # unit tests, no KVM needed
-make test-real      # + three real microVM tests (~10s)
+make test-real      # + real microVM tests, including the egress escape test
 ```
 
 ## Caveats
 
 - podman's `--tmpfs` is ignored under krun; mvm hides directories with an empty read-only bind instead.
+- Ports: Smokescreen's ACL is host-only, so the proxy runs in a pod whose network namespace has an nftables egress filter (loaded by a one-shot `NET_ADMIN` container; Smokescreen itself has no capabilities): only TCP 443 out, plus DNS to the pod's resolver. An allowed host on any other port is refused, recorded as denied, and holds the run. Host loopback, link-local, private and CGNAT ranges and IP literals are refused by Smokescreen (checked with real CONNECT probes).
 - Writable caches are single-writer: concurrent builds of the same ecosystem wait on the lock.
 - A failing build (non-zero exit, including failing tests) discards that run's build-cache writes; the next run rebuilds.
 - Rust path dependencies outside the project directory and npm workspaces with nested `node_modules` are not handled by `fetch` yet.

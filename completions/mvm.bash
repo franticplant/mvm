@@ -10,27 +10,27 @@ _mvm_cache_names() {
 _mvm_completion() {
     local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}" i
     for ((i = 1; i < COMP_CWORD; i++)); do
-        [[ "${COMP_WORDS[i]}" == "--" ]] && { COMPREPLY=($(compgen -f -- "$cur")); return; }
+        [[ "${COMP_WORDS[i]}" == "--" ]] && { mapfile -t COMPREPLY < <(compgen -f -- "$cur"); return; }
     done
     if ((COMP_CWORD == 1)); then
-        COMPREPLY=($(compgen -W "fetch build run status update cache" -- "$cur"))
+        mapfile -t COMPREPLY < <(compgen -W "fetch build run status update cache" -- "$cur")
         return
     fi
     case "${COMP_WORDS[1]}" in
-        fetch) ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "go rust node --" -- "$cur")) ;;
+        fetch) mapfile -t COMPREPLY < <(compgen -W "go rust node --learn --" -- "$cur") ;;
         build|run)
             case "$prev" in
-                -w) COMPREPLY=($(compgen -d -- "$cur")) ;;
+                -w) mapfile -t COMPREPLY < <(compgen -d -- "$cur") ;;
                 -i) ;;
                 *) local w="-w --it --"
                    [[ "${COMP_WORDS[1]}" == build ]] && w="go rust node $w" || w="-i $w"
-                   COMPREPLY=($(compgen -W "$w" -- "$cur")) ;;
+                   mapfile -t COMPREPLY < <(compgen -W "$w" -- "$cur") ;;
             esac ;;
         cache)
             if ((COMP_CWORD == 2)); then
-                COMPREPLY=($(compgen -W "rm grow gc" -- "$cur"))
+                mapfile -t COMPREPLY < <(compgen -W "rm grow gc" -- "$cur")
             elif ((COMP_CWORD == 3)) && [[ "${COMP_WORDS[2]}" == rm || "${COMP_WORDS[2]}" == grow ]]; then
-                COMPREPLY=($(compgen -W "$(_mvm_cache_names)" -- "$cur"))
+                mapfile -t COMPREPLY < <(compgen -W "$(_mvm_cache_names)" -- "$cur")
             fi ;;
     esac
 }

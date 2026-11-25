@@ -4,6 +4,7 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .SH SYNOPSIS
 .B mvm fetch
 .RB [ go | rust | node ]
+.RB [ \-\-learn ]
 .RB [ \-\-
 .IR CMD ...]
 .br
@@ -53,6 +54,19 @@ for every ecosystem found in the current directory. With
 it runs that command instead, to change dependencies
 .RB ( "go get" ", " "cargo add" ", " "npm install" ).
 Manifests that changed are copied back into the project and listed.
+.PP
+The fetch VM has no direct network. Its only way out is TCP to one
+host\-loopback port, where a per\-run Smokescreen proxy (in a pod whose
+kernel egress filter allows only TCP 443) allows only the
+ecosystem's registries (plus
+.B [allow]
+from the config); DNS, other TCP, UDP, ICMP and IPv6 are closed. Each
+connection and denial is logged in the run record and summarised.
+.B \-\-learn
+lets every host through but logs it, commits nothing, and prints the hosts
+outside the allowlist. Without the proxy binary
+.RI ( ~/.local/lib/mvm/smokescreen ", built by " "make smokescreen" ),
+fetch refuses to run.
 .PP
 .B build
 runs offline in the current project, mounted read\-only at
@@ -115,6 +129,8 @@ Optional:
 (list),
 .B [images]
 (go, rust, node),
+.B [allow]
+(go, rust, node: lists of extra hosts for fetch),
 .B [memory]
 (go, rust, node, run).
 .TP
@@ -124,7 +140,10 @@ One JSON record per run (last 200).
 .BR MVM_CACHE_DIR ", " MVM_STATE_DIR ", " MVM_CONFIG
 override the paths above.
 .SH EXIT STATUS
-The command's exit status; 2 for usage errors; 130 when interrupted.
+The command's exit status; 2 for usage errors; 130 when interrupted;
+3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
+nothing is committed or copied back); 4 when the egress proxy died mid\-run or
+its log could not be read (nothing committed).
 .SH EXAMPLES
 .nf
 mvm fetch
@@ -137,8 +156,7 @@ mvm run \-i docker.io/library/alpine:3.24 \-\- uname \-a
 .SH CAVEATS
 podman's
 .B \-\-tmpfs
-is ignored under krun. Egress during fetch is not yet restricted; see
-.BR "mvm status" .
+is ignored under krun.
 .SH SEE ALSO
 .BR podman\-run (1),
 .BR flock (2)
