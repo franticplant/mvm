@@ -131,6 +131,10 @@ def prune_records() -> None:
 
 
 def execute(plan: Plan) -> int:
+    if plan.net and not egress.smokescreen_bin().is_file():
+        # Fail closed before touching caches or writing a record.
+        raise core.MvmError(f"egress proxy missing: {egress.smokescreen_bin()} (run `make smokescreen` "
+                            "in the mvm repo); fetch refuses to run without it")
     run_id = new_run_id()
     reap_orphans()
     project = plan.project

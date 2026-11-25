@@ -257,6 +257,24 @@ class EgressTests(Base):
             with self.assertRaises(SystemExit, msg=bad):
                 self.mvm.load_config()
 
+    def test_fetch_fails_closed_without_proxy_binary(self):
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "no-lib"
+        with mock.patch("subprocess.run") as run:
+            with self.assertRaises(self.mvm.MvmError) as e:
+                with self.mvm.Proxy("RID", ["a.org"], "enforce"):
+                    pass
+        self.assertIn("refuses", str(e.exception))
+        run.assert_not_called()                      # nothing started, no podman call at all
+
+    def test_execute_refuses_networked_run_before_touching_anything(self):
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "no-lib"
+        plan = self.mvm.Plan(kind="fetch", eco="go", image="i", memory="1g", cmd=["x"], src=None,
+                             net=True, caches=[self.mvm.Cache("c9", "/c9", True, "16M")])
+        with self.assertRaises(self.mvm.MvmError):
+            self.mvm.execute(plan)
+        self.assertFalse(self.mvm.cache_img("c9").exists())           # no cache created
+        self.assertFalse((self.mvm.STATE_ROOT / "runs").exists())     # no run record
+
     def test_summarize_real_smokescreen_log_shapes(self):
         # Field shapes copied from a real Smokescreen v2 run (report mode, go mod download).
         D, C = "CANONICAL-PROXY-DECISION", "CANONICAL-PROXY-CN-CLOSE"
@@ -336,6 +354,9 @@ class CommitTests(Base):
             def __init__(self, *a): self.port = 1; self.summary = {"allowed": {}, "denied": {}}
             def __enter__(self): return self
             def __exit__(self, *e): return False
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
+        self.mvm.LIB_DIR.mkdir()
+        (self.mvm.LIB_DIR / "smokescreen").write_text("")       # present; the proxy itself is faked
         with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy):
             def fake(argv):
                 src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
