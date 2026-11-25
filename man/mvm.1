@@ -68,6 +68,15 @@ outside the allowlist. Without the proxy binary
 .RI ( ~/.local/lib/mvm/smokescreen ", built by " "make smokescreen" ),
 fetch refuses to run.
 .PP
+With
+.B [observer] enabled = true
+in the config, a passive nDPI (ndpiReader) sidecar in the proxy pod records
+each outbound TLS flow's SNI, JA4 and bytes in the run record. A TLS name
+outside the allowlist, or a flow without SNI, holds the run (exit 3). The
+observer fails closed: without its image
+.RB ( "make observer" )
+fetch refuses to run, and a dead observer commits nothing (exit 5).
+.PP
 .B build
 runs offline in the current project, mounted read\-only at
 .IR /src ,
@@ -132,7 +141,9 @@ Optional:
 .B [allow]
 (go, rust, node: lists of extra hosts for fetch),
 .B [memory]
-(go, rust, node, run).
+(go, rust, node, run),
+.B [observer]
+(enabled = true|false, default false).
 .TP
 .I ~/.local/state/mvm/runs/
 One JSON record per run (last 200).
@@ -143,7 +154,8 @@ override the paths above.
 The command's exit status; 2 for usage errors; 130 when interrupted;
 3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
 nothing is committed or copied back); 4 when the egress proxy died mid\-run or
-its log could not be read (nothing committed).
+its log could not be read (nothing committed); 5 when the observer was on and
+died mid\-run or its flows could not be read (nothing committed).
 .SH EXAMPLES
 .nf
 mvm fetch

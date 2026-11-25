@@ -31,6 +31,7 @@ LIB_DIR = Path(os.environ.get("MVM_LIB_DIR", HOME / ".local" / "lib" / "mvm"))
 KEEP_RUNS = 200
 EXIT_EGRESS_DENIED = 3     # fetch exited 0 but tried a denied host: held, not committed
 EXIT_PROXY_FAILED = 4      # egress proxy died mid-run or its log was unreadable
+EXIT_OBSERVER_FAILED = 5   # observer (enabled) died mid-run or its flows were unreadable
 
 
 DEFAULT_MASK = [
@@ -81,9 +82,12 @@ def load_config() -> dict:
             cfg = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         die(f"{CONFIG_PATH}: {e}")
-    unknown = set(cfg) - {"mask", "images", "memory", "allow"}
+    unknown = set(cfg) - {"mask", "images", "memory", "allow", "observer"}
     if unknown:
-        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory, allow)")
+        die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: mask, images, memory, allow, observer)")
+    obs = cfg.get("observer", {})
+    if not isinstance(obs, dict) or set(obs) - {"enabled"} or not isinstance(obs.get("enabled", False), bool):
+        die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false")
     allow = cfg.get("allow", {})
     if not isinstance(allow, dict) or not all(
             k in ECOS and isinstance(v, list) and all(valid_allow_host(h) for h in v)
