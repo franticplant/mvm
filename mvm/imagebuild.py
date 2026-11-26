@@ -50,7 +50,7 @@ def instructions(text: str) -> list[tuple[str, str]]:
             cur += line[:-1] + " "
             continue
         cur += line
-        m = re.search(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?", cur)
+        m = HEREDOC.search(cur)
         if m and cur.split(None, 1)[0].upper() in ("RUN", "COPY", "ADD"):
             heredoc = m.group(1)
             continue
@@ -59,6 +59,51 @@ def instructions(text: str) -> list[tuple[str, str]]:
     if cur:
         out.append(_split(cur))
     return out
+
+
+HEREDOC = re.compile(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
+
+
+def _starts(text: str):
+    """Yield (raw line index, instruction word) for each raw line that starts a logical
+    line, with the same heredoc and continuation rules as instructions()."""
+    heredoc, cont, cur = None, False, ""
+    for i, raw in enumerate(text.splitlines()):
+        if heredoc is not None:
+            if raw.strip() == heredoc:
+                heredoc = None
+            continue
+        line = raw.strip()
+        if not cont and (not line or line.startswith("#")):
+            continue
+        if cont and line.startswith("#"):
+            continue
+        if not cont:
+            cur = ""
+            yield i, line.split(None, 1)[0].upper()
+        cur += line
+        cont = line.endswith("\\")
+        m = HEREDOC.search(cur)
+        if not cont and m and cur.split(None, 1)[0].upper() in ("RUN", "COPY", "ADD"):
+            heredoc = m.group(1)
+
+
+def pin_from(text: str, pins: dict[str, str]) -> str:
+    """The Containerfile with each external FROM ref replaced by its pinned repo@digest,
+    so the build uses exactly the pinned image (a moved tag cannot change it)."""
+    lines = text.split("\n")
+    for i, word in _starts(text):
+        if word != "FROM":
+            continue
+        m = re.match(r"(\s*\S+\s+(?:--\S+\s+)*)(\S+)(.*)$", lines[i], re.S)
+        if not m:
+            raise core.MvmError("FROM: put the image on the same line as FROM")
+        ref = m.group(2)
+        if ref.endswith("\\"):
+            raise core.MvmError("FROM: put the image on the same line as FROM")
+        if ref in pins:
+            lines[i] = m.group(1) + pins[ref] + m.group(3)
+    return "\n".join(lines)
 
 
 def _split(line: str) -> tuple[str, str]:
@@ -71,6 +116,10 @@ def base_images(text: str) -> list[str]:
     host or podman would fetch outside the proxy."""
     stages: set[str] = set()
     images: list[str] = []
+    for raw in text.splitlines():
+        d = re.match(r"\s*#\s*escape\s*=\s*(\S*)", raw, re.I)
+        if d and d.group(1) != "\\":
+            raise core.MvmError(f"# escape={d.group(1)}: only the default escape (\\) is supported")
     for ins, arg in instructions(text):
         if ins == "FROM":
             words = [w for w in arg.split() if not w.startswith("--")]
@@ -89,17 +138,19 @@ def base_images(text: str) -> list[str]:
                                     f"(e.g. docker.io/library/{ref})")
             if ref not in images:
                 images.append(ref)
-        elif ins == "ADD":
-            for w in arg.split():
-                if not w.startswith("--") and (re.match(r"[a-z][a-z0-9+.-]*://", w, re.I) or w.startswith("git@")):
-                    raise core.MvmError(f"ADD {w}: podman fetches ADD URLs on the host, outside the egress; "
-                                        "download it in a RUN step instead")
+        elif ins == "ADD" and "<<" not in arg.split("\n")[0]:
+            # The context holds only the Containerfile, so ADD can only mean a URL or git
+            # repository, which podman would fetch on the host, outside the egress.
+            raise core.MvmError(f"ADD {arg.splitlines()[0][:80]}: not supported (podman fetches ADD "
+                                "sources on the host); download in a RUN step, or use COPY --from")
         elif ins == "RUN":
             for w in arg.split():                 # RUN's own options come before the command
                 if not w.startswith("--"):
                     break
                 if w == "--network" or w.startswith("--network="):
                     raise core.MvmError("RUN --network=...: a build step may not choose its own network")
+                if w == "--security" or w.startswith("--security="):
+                    raise core.MvmError("RUN --security=...: a build step may not change its sandbox")
     return images
 
 
@@ -130,11 +181,13 @@ def build(tag: str, containerfile: Path, cfg: dict) -> tuple[int, dict]:
     if len(data) > MAX_CONTAINERFILE:
         raise core.MvmError(f"{containerfile} is larger than 1 MiB")
     text = data.decode()
+    pins = {}
     for ref in base_images(text):
         if not ref.startswith("localhost/"):
-            core.pinned(ref)                     # pulls through the egress when missing
+            pins[ref] = core.pinned(ref)         # pulls through the egress when missing
         elif subprocess.run(["podman", "image", "exists", ref]).returncode != 0:
             raise core.MvmError(f"FROM {ref}: no such local image (build it first)")
+    data = pin_from(text, pins).encode()
     tmp_tag = f"localhost/mvm-build-tmp:{secrets.token_hex(6)}"
     ctx = Path(tempfile.mkdtemp(prefix="mvm-image-build-"))
     try:

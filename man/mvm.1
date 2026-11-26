@@ -202,7 +202,7 @@ through the egress first, then the build runs with
 The result gets the requested
 .I localhost/
 tag only after a clean run; otherwise the temporary image is deleted (exit 3, 4 or 5).
-ADD of a URL, RUN \-\-network and FROM with variables are refused.
+Base images are used by their pinned digest. ADD (except heredocs), RUN \-\-network, RUN \-\-security, a non\-default # escape and FROM with variables are refused.
 .SH FILES
 .TP
 .I ~/.config/mvm/config.toml

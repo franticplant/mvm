@@ -398,7 +398,28 @@ class ImageBuildTests(Base):
                     "FROM docker.io/library/alpine:3.24\nRUN --mount=type=cache,target=/c --network host true\n"):
             with self.assertRaises(self.mvm.MvmError, msg=bad):
                 ib.base_images(bad)
-        ib.base_images("FROM docker.io/library/alpine:3.24\nADD ./local /x\nRUN echo --network=x\n")
+        ib.base_images("FROM docker.io/library/alpine:3.24\nADD <<EOF /x\nhello\nEOF\nRUN echo --network=x\n")
+        for bad in ('FROM docker.io/library/alpine:3.24\nADD ["https://evil.example/x", "/x"]\n',   # JSON form
+                    "FROM docker.io/library/alpine:3.24\nADD ./local /x\n",
+                    "FROM docker.io/library/alpine:3.24\nRUN --security=insecure id\n",
+                    "# escape=`\nFROM docker.io/library/alpine:3.24\nRUN echo `\n  ADD https://e/x /x\n"):
+            with self.assertRaises(self.mvm.MvmError, msg=bad):
+                ib.base_images(bad)
+        ib.base_images("# escape=\\\nFROM docker.io/library/alpine:3.24\n")
+
+    def test_from_is_rewritten_to_the_pinned_digest(self):
+        ib = self.mvm.imagebuild
+        cf = ("FROM --platform=linux/amd64 docker.io/library/golang:1.27-alpine AS build\n"
+              "RUN <<EOF\nFROM docker.io/library/golang:1.27-alpine\nEOF\n"
+              "FROM build\nfrom docker.io/library/alpine:3.24\n")
+        out = ib.pin_from(cf, {"docker.io/library/golang:1.27-alpine": "docker.io/library/golang@sha256:aa",
+                               "docker.io/library/alpine:3.24": "docker.io/library/alpine@sha256:bb"})
+        self.assertEqual(out.splitlines(), [
+            "FROM --platform=linux/amd64 docker.io/library/golang@sha256:aa AS build",
+            "RUN <<EOF", "FROM docker.io/library/golang:1.27-alpine", "EOF",         # heredoc body untouched
+            "FROM build", "from docker.io/library/alpine@sha256:bb"])
+        with self.assertRaises(self.mvm.MvmError):
+            ib.pin_from("FROM \\\n  docker.io/library/alpine:3.24\n", {})
 
     def test_build_argv_is_krun_confined_and_offline_for_images(self):
         net = self.mvm.vm_network_args(4321)
@@ -415,7 +436,7 @@ class ImageBuildTests(Base):
 
     def test_context_holds_only_the_containerfile_and_failures_tag_nothing(self):
         ib = self.mvm.imagebuild
-        self.write("Containerfile", "FROM scratch\n")
+        self.write("Containerfile", "FROM docker.io/library/alpine:3.24\nRUN true\n")
         self.write(".env", "SECRET=1")
         seen, calls = {}, []
 
@@ -423,6 +444,7 @@ class ImageBuildTests(Base):
             argv = plan.argv_fn(self.mvm.vm_network_args(1), 1)
             ctx = Path(argv[-1])
             seen["files"] = sorted(p.name for p in ctx.iterdir())
+            seen["cf"] = (ctx / "Containerfile").read_text()
             seen["plan"] = plan
             return 3
 
@@ -430,9 +452,11 @@ class ImageBuildTests(Base):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
         with mock.patch.object(sys.modules["mvm.runtime"], "execute", fake_execute), \
-                mock.patch.object(ib.subprocess, "run", fake_run):
+                mock.patch.object(ib.subprocess, "run", fake_run), \
+                mock.patch.object(ib.core, "pinned", return_value="docker.io/library/alpine@sha256:cc"):
             rc, _ = ib.build("localhost/x:1", self.proj / "Containerfile", {})
         self.assertEqual(rc, 3)
+        self.assertEqual(seen["cf"], "FROM docker.io/library/alpine@sha256:cc\nRUN true\n")    # the pin, not the tag
         self.assertEqual(seen["files"], ["Containerfile"])
         self.assertEqual((seen["plan"].kind, seen["plan"].net), ("image-build", True))
         self.assertIn("dl-cdn.alpinelinux.org", seen["plan"].allow)
