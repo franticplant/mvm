@@ -7,7 +7,8 @@ host config turns it off). It fails closed: a missing image refuses the run; a d
 sensor, unreadable output, kernel drops or too many flows mean nothing is committed
 (exit 5). A connection that is not TLS, has no SNI, an SNI outside the allowlist, or a
 reassembly fault holds the run (exit 3): the proxy only checks the CONNECT host, so this
-is what catches domain fronting and plaintext tunnelled to an allowed host.
+is what catches SNI-level domain fronting and plaintext tunnelled to an allowed host
+(fronting by the Host header inside encrypted TLS is invisible to it).
 
 The sensor is stdlib Python in the official Python image (pinned by digest), with
 tlsobs.py mounted read-only: nothing to build, nothing from nDPI. nDPI 5.0 is kept
@@ -68,6 +69,18 @@ def _matches(host: str, allow: list[str]) -> bool:
         if host == a or (a.startswith("*.") and host.endswith(a[1:])):
             return True
     return False
+
+
+def _lines_ok(lines: list[str] | None) -> bool:
+    """Every non-empty flow line is a JSON object (a truncated or corrupt line fails the run)."""
+    for ln in lines or []:
+        if ln.strip():
+            try:
+                if not isinstance(json.loads(ln), dict):
+                    return False
+            except ValueError:
+                return False
+    return True
 
 
 def summarize(lines: list[str], allow: list[str]) -> dict:
@@ -193,9 +206,10 @@ class Observer:
                 except ValueError:
                     self.stats = None
         st = self.stats if isinstance(self.stats, dict) else {}
-        # Fail closed on capture loss: the kernel dropped nothing and no flow was turned away.
-        stats_ok = st.get("drops") == 0 and st.get("overflow") == 0
-        self.healthy = alive and code == "0" and lines is not None and stats_ok
+        # Fail closed on capture loss: the kernel dropped nothing, no flow was turned away,
+        # no frame was unreadable, and every flow line is intact.
+        stats_ok = all(type(st.get(k)) is int and st[k] == 0 for k in ("drops", "overflow", "unparsed"))
+        self.healthy = alive and code == "0" and lines is not None and stats_ok and _lines_ok(lines)
         return lines
 
     def _cleanup(self) -> None:

@@ -108,6 +108,12 @@ def handshake_bytes(stream: bytes) -> bytes:
                 return hs[4:need]
 
 
+def _u16s(v: bytes, what: str) -> list[int]:
+    if len(v) % 2:
+        raise NotHello(f"{what}: odd length")
+    return list(struct.unpack(f">{len(v) // 2}H", v))
+
+
 def parse_client_hello(body: bytes) -> dict:
     """ClientHello body (after the 4-byte handshake header) -> its fields, wire order kept."""
     r = _Reader(body, "ClientHello")
@@ -115,9 +121,9 @@ def parse_client_hello(body: bytes) -> dict:
     r.take(32)                                   # random
     r.vec(1)                                     # legacy_session_id
     cs = r.vec(2)
-    if len(cs) % 2 or not cs:
-        raise NotHello("bad cipher_suites")
-    ciphers = list(struct.unpack(f">{len(cs) // 2}H", cs))
+    if not cs:
+        raise NotHello("no cipher_suites")
+    ciphers = _u16s(cs, "cipher_suites")
     r.vec(1)                                     # legacy_compression_methods
     exts: list[int] = []
     sni, alpn, sigalgs, versions = None, [], [], []
@@ -127,24 +133,30 @@ def parse_client_hello(body: bytes) -> dict:
             raise NotHello("trailing bytes after extensions")
         while not er.done():
             etype, edata = er.u16(), er.vec(2)
+            if etype in exts:                    # RFC 8446 4.2: a server may resolve duplicates differently
+                raise NotHello(f"duplicate extension 0x{etype:04x}")
             exts.append(etype)
             x = _Reader(edata, f"extension 0x{etype:04x}")
             if etype == EXT_SNI and edata:
                 lst = _Reader(x.vec(2), "server_name_list")
                 while not lst.done():
                     kind, name = lst.u8(), lst.vec(2)
-                    if kind == 0 and sni is None:
+                    if kind == 0:
+                        if sni is not None:      # RFC 6066 3: one host_name only
+                            raise NotHello("more than one host_name in server_name")
                         sni = name.decode("ascii", "backslashreplace")
             elif etype == EXT_ALPN:
                 lst = _Reader(x.vec(2), "alpn")
                 while not lst.done():
                     alpn.append(lst.vec(1))
             elif etype == EXT_SIGALGS:
-                v = x.vec(2)
-                sigalgs = list(struct.unpack(f">{len(v) // 2}H", v[:len(v) // 2 * 2]))
+                sigalgs = _u16s(x.vec(2), "signature_algorithms")
             elif etype == EXT_VERSIONS:
-                v = x.vec(1)
-                versions = list(struct.unpack(f">{len(v) // 2}H", v[:len(v) // 2 * 2]))
+                versions = _u16s(x.vec(1), "supported_versions")
+            else:
+                continue
+            if not x.done():
+                raise NotHello(f"trailing bytes in extension 0x{etype:04x}")
     return {"legacy_version": legacy, "ciphers": ciphers, "extensions": exts, "sni": sni,
             "alpn": alpn, "sigalgs": sigalgs, "versions": versions}
 
@@ -165,7 +177,7 @@ def _alpn_chars(alpn: list[bytes]) -> str:
 
 def ja4(h: dict, transport: str = "t") -> str:
     """JA4 (TLS client) per FoxIO's BSD-3 specification."""
-    versions = [v for v in h["versions"] if not is_grease(v)]
+    versions = [v for v in h["versions"] if v in TLS_VERSIONS]      # drops GREASE and unknown drafts
     ver = TLS_VERSIONS.get(max(versions) if versions else h["legacy_version"], "00")
     ciphers = [c for c in h["ciphers"] if not is_grease(c)]
     exts = [e for e in h["extensions"] if not is_grease(e)]
@@ -290,7 +302,7 @@ class Tracker:
             key = (src, sport, dst, dport)
             f = self.flows.get(key)
             if flags & 0x02 and not flags & 0x10:          # SYN: a new connection (or its retry)
-                if f is None or (f.isn != seq and (f.closed or f.result is not None)):
+                if f is None or f.isn != seq:            # same ISN: a retransmitted SYN
                     if len(self.all) >= MAX_FLOWS:
                         self.overflow += 1
                         return
@@ -299,6 +311,8 @@ class Tracker:
                 return                                     # else a retransmitted SYN
             if f is None:
                 return                                     # started before the capture: unobserved
+            if flags & 0x20 and f.result is None:
+                f.fault = "TCP urgent data"               # never from Smokescreen's own stack
             if payload_len and payload is None:
                 f.fault = "outbound payload not captured"
             elif payload:
@@ -321,6 +335,9 @@ class Tracker:
         return [f.record() for f in self.all if f.established]
 
 
+UNPARSED = [0]                                  # IP frames we cannot read as TCP: fragments, IPv6 ext headers
+
+
 def _tcp(ip: bytes):
     """IPv4/IPv6 + TCP headers -> (src, dst, sport, dport, seq, flags, payload_len, payload).
     payload is None when the frame was captured truncated (inbound frames are, on purpose)."""
@@ -331,12 +348,16 @@ def _tcp(ip: bytes):
         ihl = (ip[0] & 15) * 4
         if ip[9] != 6 or ihl < 20 or len(ip) < ihl + 20:
             return None
-        if struct.unpack(">H", ip[6:8])[0] & 0x3fff:        # fragment: not seen from a TCP stack here
+        if struct.unpack(">H", ip[6:8])[0] & 0x3fff:        # a fragment: Linux TCP sets DF, so never expected
+            UNPARSED[0] += 1
             return None
         total = struct.unpack(">H", ip[2:4])[0] or len(ip)
         src, dst, off = socket.inet_ntop(socket.AF_INET, ip[12:16]), socket.inet_ntop(socket.AF_INET, ip[16:20]), ihl
     elif v == 6:
-        if ip[6] != 6 or len(ip) < 60:                      # TCP right after the header (no extension headers)
+        if ip[6] in (0, 43, 44, 50, 51, 60):                 # extension headers: never from kernel TCP here
+            UNPARSED[0] += 1
+            return None
+        if ip[6] != 6 or len(ip) < 60:
             return None
         total = 40 + struct.unpack(">H", ip[4:6])[0] if struct.unpack(">H", ip[4:6])[0] else len(ip)
         src, dst, off = socket.inet_ntop(socket.AF_INET6, ip[8:24]), socket.inet_ntop(socket.AF_INET6, ip[24:40]), 40
@@ -346,6 +367,8 @@ def _tcp(ip: bytes):
     doff = (ip[off + 12] >> 4) * 4
     flags = ip[off + 13]
     start = off + doff
+    if doff < 20 or start > total:
+        return None
     plen = max(0, total - start)
     payload = ip[start:total] if len(ip) >= total else None
     return src, dst, sport, dport, seq, flags, plen, payload
@@ -396,7 +419,7 @@ def _ring(s: socket.socket):
     s.setsockopt(SOL_PACKET, PACKET_VERSION, TPACKET_V3)
     frame = 2048
     req = struct.pack("=IIIIIII", RING_BLOCK, RING_BLOCKS, frame, RING_BLOCK * RING_BLOCKS // frame,
-                      50, 0, 0)                 # retire a partly filled block after 50 ms
+                      20, 0, 0)                 # retire a partly filled block after 20 ms
     s.setsockopt(SOL_PACKET, PACKET_RX_RING, req)
     return mmap.mmap(s.fileno(), RING_BLOCK * RING_BLOCKS, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
 
@@ -424,10 +447,10 @@ def _blocks(ring, start: int):
 def capture(iface: str, out: str, pcap: str | None = None) -> int:
     import select
     import time
-    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)    # protocol 0: receives nothing until bound
     _attach_filter(s)
     ring = _ring(s)
-    s.bind((iface, 0))
+    s.bind((iface, ETH_P_ALL))
     stop = []
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
@@ -435,9 +458,11 @@ def capture(iface: str, out: str, pcap: str | None = None) -> int:
     pw = Pcap(pcap) if pcap else None
     print(f"{READY} on {iface}", flush=True)
 
-    def drain():
+    def drain() -> int:
         nonlocal nxt, packets
+        seen = 0
         for following, frames in _blocks(ring, nxt):
+            seen += len(frames)
             nxt = following                     # resume here next time
             for ip, outgoing in frames:
                 if not ip or ip[0] >> 4 not in (4, 6):
@@ -446,6 +471,7 @@ def capture(iface: str, out: str, pcap: str | None = None) -> int:
                 tr.packet(ip, outgoing)
                 if pw and outgoing:
                     pw.write(time.time(), ip, len(ip))
+        return seen
 
     while not stop:
         try:
@@ -453,8 +479,11 @@ def capture(iface: str, out: str, pcap: str | None = None) -> int:
         except InterruptedError:
             pass
         drain()
-    time.sleep(0.1)                             # frames already in flight, then the last blocks
     drain()
+    for _ in range(10):                         # the last, partly filled block retires after 20 ms
+        time.sleep(0.05)
+        if not drain():
+            break
     st = s.getsockopt(SOL_PACKET, PACKET_STATISTICS, 12)   # tpacket_stats_v3
     drops += struct.unpack("=III", st)[1]
     with open(out, "w") as f:
@@ -462,7 +491,7 @@ def capture(iface: str, out: str, pcap: str | None = None) -> int:
             f.write(json.dumps(r) + "\n")
     if pw:
         pw.f.close()
-    print(STATS + json.dumps({"packets": packets, "drops": drops, "overflow": tr.overflow,
+    print(STATS + json.dumps({"packets": packets, "drops": drops, "overflow": tr.overflow, "unparsed": UNPARSED[0],
                               "faults": sum(1 for f in tr.all if f.fault)}), flush=True)
     return 0
 

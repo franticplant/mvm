@@ -505,9 +505,24 @@ class TlsSensorTests(Base):
         f.client_data(2, b"\x16\x03\x03\x40\x00" + b"\x01\x00\x40\x00" + b"\0" * (t.HELLO_CAP + 100))
         self.assertEqual(f.result["proto"], "non-TLS")
 
+    def test_ambiguous_hellos_are_not_tls(self):
+        """Anything a server might read differently from us is refused (held): duplicate
+        extensions or host names (first-wins here, last-wins there), trailing or odd bytes."""
+        t = self.mvm.tlsobs
+        two = b"\x00\x00\x05allow" + b"\x00\x00\x04evil"
+        cases = {"duplicate SNI extension": [self.sni(b"allowed.org"), self.sni(b"evil.org")],
+                 "two host names": [(0x0000, struct.pack(">H", len(two)) + two)],
+                 "duplicate other extension": [self.sni(b"a.org"), (0x000a, b"\0\0"), (0x000a, b"\0\0")],
+                 "trailing bytes in SNI": [(0x0000, self.sni(b"a.org")[1] + b"evil.org")],
+                 "odd sigalgs": [self.sni(b"a.org"), (0x000d, b"\x00\x03\x08\x04\x01")]}
+        for name, exts in cases.items():
+            self.assertEqual(t.classify(self.hello(exts=exts))["proto"], "non-TLS", name)
+        versions = (0x002b, bytes([6]) + struct.pack(">HHH", 0x7f1c, 0x0304, 0xffff))   # drafts/unknown
+        self.assertTrue(t.classify(self.hello(exts=[versions]))["ja4"].startswith("t13i"))
+
     @staticmethod
-    def ip4(src, dst, sport, dport, seq, flags, payload=b""):
-        tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 0, 5 << 4, flags, 65535, 0, 0) + payload
+    def ip4(src, dst, sport, dport, seq, flags, payload=b"", doff=5):
+        tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 0, doff << 4, flags, 65535, 0, 0) + payload
         hdr = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 0, 0x4000, 64, 6, 0,
                           socket.inet_aton(src), socket.inet_aton(dst))
         return hdr + tcp
@@ -530,6 +545,18 @@ class TlsSensorTests(Base):
         r = tr.records()
         self.assertEqual([(x["proto"], x["sni"]) for x in r], [("TLS", "registry.npmjs.org"), ("non-TLS", "")])
         self.assertEqual((r[0]["bytes_out"], r[0]["bytes_in"]), (len(stream), 500))
+        tr = t.Tracker()                                          # port reused after an unanswered SYN
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50000, 443, 100, 0x02), True)
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50000, 443, 100, 0x02), True)     # its retransmission
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50000, 443, 7000, 0x02), True)    # a new connection
+        tr.packet(self.ip4("1.1.1.1", "10.0.0.2", 443, 50000, 1, 0x12), False)
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50000, 443, 7001, 0x18, stream), True)
+        self.assertEqual([x["sni"] for x in tr.records()], ["registry.npmjs.org"])
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50001, 443, 1, 0x02), True)       # urgent data
+        tr.packet(self.ip4("1.1.1.1", "10.0.0.2", 443, 50001, 1, 0x12), False)
+        tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 50001, 443, 2, 0x38, stream), True)
+        self.assertEqual(tr.records()[-1]["fault"], "TCP urgent data")
+        self.assertIsNone(t._tcp(self.ip4("10.0.0.2", "1.1.1.1", 50002, 443, 1, 0x18, stream, doff=3)))
         tr = t.Tracker()
         for i in range(t.MAX_FLOWS + 3):
             tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 1024 + i, 443, 1, 0x02), True)
@@ -579,10 +606,13 @@ class ObserverTests(Base):
 
     def test_stop_health_needs_clean_exit_flows_and_zero_drops(self):
         st = self.mvm.tlsobs.STATS
-        ok = st + '{"packets": 9, "drops": 0, "overflow": 0, "faults": 0}\n'
+        ok = st + '{"packets": 9, "drops": 0, "overflow": 0, "unparsed": 0, "faults": 0}\n'
         cases = [(ok, "0", True, self.REAL), (ok, "0", True, ""),              # quiet fetch: still a stats line
                  (ok.replace('"drops": 0', '"drops": 3'), "0", False, self.REAL),
+                 (ok.replace('"drops": 0', '"drops": false'), "0", False, self.REAL),
                  (ok.replace('"overflow": 0', '"overflow": 1'), "0", False, self.REAL),
+                 (ok.replace('"unparsed": 0', '"unparsed": 2'), "0", False, self.REAL),
+                 (ok, "0", False, self.REAL[:40]),                               # a truncated flow line
                  ("", "0", False, ""),                                          # no stats line: not trusted
                  (st + "{not json\n", "0", False, self.REAL),
                  (ok, "137", False, self.REAL)]
