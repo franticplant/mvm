@@ -17,11 +17,13 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 | `mvm build [go\|rust\|node] -- CMD` | no | the project, read-only, with `.git`, `.env*` and key files hidden | build caches, `node_modules`, and `-w DIR` |
 | `mvm run -i IMAGE -- CMD` | no | same as build | `-w DIR` only |
 | `mvm check [--all]` | only api.osv.dev | **only** the lockfiles | nothing (a check record) |
+| `mvm pull IMAGE`, `mvm update` | only image registries | nothing | the image, loaded offline after a clean run |
 
 - **No third-party code runs with network.** `go mod download` and `cargo fetch` run none; npm runs with `--ignore-scripts` (run them offline: `mvm build node -- npm rebuild`); Go may not download a newer toolchain (`GOTOOLCHAIN=local`).
 - **Changing dependencies** is a fetch with a command: `mvm fetch go -- go get golang.org/x/net@latest`, `mvm fetch rust -- cargo generate-lockfile`, `mvm fetch node -- npm install --ignore-scripts left-pad`. Only manifest/lockfile changes flow back, and mvm lists them.
 - **Commit-on-clean.** Every writable cache is a reflink copy for the duration of the run and replaces the cache atomically only on exit 0. A failure, Ctrl-C, crash or `kill -9` leaves the cache exactly as it was.
-- **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed.
+- **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed. Every container mvm starts uses `--pull=never`: a pinned image that is missing locally fails the run (re-pin with `mvm pull TAG`); it is never fetched outside the egress.
+- **Confined image pulls.** `mvm pull`, `mvm update` and an image's first use pull through the same proxy and observer as fetch: a static skopeo (`make skopeo`, pure Go, in a `FROM scratch` image) is the microVM's only process and copies the image into a `dir:` layout under `~/.cache/mvm/pulls`. Only after a clean run does the host load it offline (`podman pull dir:...`, which re-checks every blob digest) and pin it by the digest of its platform manifest (`dir:` keeps the registry's manifest bytes; an OCI archive would convert Docker manifests and change the digest). The download is removed whatever happens. A registry outside the allowlist holds the pull (exit 3) with the `[allow] pull = [...]` line to add. The images `make smokescreen`/`observer`/`skopeo` need are the bootstrap and come from plain `podman pull`.
 - **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
 - **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
 - **Observer (on by default).** mvm's own passive TLS sensor (`mvm/tlsobs.py`, stdlib Python, in the official Python image pinned by digest) runs as a sidecar in the proxy pod. For every outbound connection it reassembles the start of the client's stream and records whether it is a TLS ClientHello, its SNI and [JA4](https://github.com/FoxIO-LLC/ja4) fingerprint, and the bytes each way. A TLS name outside the allowlist, no SNI, a connection that is not TLS (e.g. plaintext HTTP through CONNECT) or conflicting retransmissions hold the run like a denial (exit 3): the proxy only sees the CONNECT host, so this catches SNI-level domain fronting. Fronting by the HTTP `Host` header inside the encrypted connection (allowed SNI, another site on the same CDN) is invisible to any passive observer; it depends on the CDN refusing mismatches. It fails closed: a missing image refuses the fetch; a dead sensor, unreadable flows, kernel packet drops, or a proxy connection with no observed flow means nothing is committed (exit 5). It is written clean-room from the RFCs and FoxIO's BSD-3 JA4 spec; real tests check it against nDPI 5.0 on the same packets. `[observer] enabled = false` turns it off; `mvm status` prints `observer off` then.
@@ -58,6 +60,7 @@ run = "1g"
 
 [allow]                # extra hosts for fetch, on top of the built-in registries
 go = ["github.com", "codeload.github.com"]
+pull = ["quay.io", "cdn01.quay.io"]   # image registries beyond Docker Hub and GHCR
 
 [observer]             # TLS observer for fetch (needs `make observer`); on by default
 enabled = true
@@ -69,7 +72,7 @@ before_fetch = true
 ntfy = "https://ntfy.sh/<your-topic>"
 ```
 
-Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`; rust `index.crates.io`, `static.crates.io`; node `registry.npmjs.org`.
+Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`; rust `index.crates.io`, `static.crates.io`; node `registry.npmjs.org`; pull: Docker Hub (`auth.docker.io`, `registry-1.docker.io`, blobs from `production.cloudfront.docker.com`, `production.cloudflare.docker.com` and Docker's one R2 bucket host) and GHCR (`ghcr.io`, `pkg-containers.githubusercontent.com`).
 
 ## For AI coding agents
 
@@ -89,6 +92,7 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 sudo dnf install podman crun-krun e2fsprogs
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
+make skopeo         # build skopeo offline with mvm (static, FROM scratch); image pulls refuse without it
 make observer       # pull the observer's Python image (pinned by digest); on by default, fetch refuses without it
 make ndpi-oracle    # optional, tests only: nDPI 5.0 (last all-LGPLv3 release) to check the observer against
 make timer          # optional: daily `mvm check --all` as a systemd user timer

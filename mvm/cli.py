@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import check, core, egress, observer
+from . import check, core, egress, observer, pull
 from .cache import cache_img, cache_meta, run_copies, try_exclusive
 from .core import DEFAULT_MASK, MvmError, die, find_sbin, load_config, now_iso, pinned, pins_path, read_json, resolve_digest, say, write_json_atomic
 from .ecos import ECOS, Eco, eco_caches
@@ -97,9 +97,7 @@ def cmd_fetch(args: list[str]) -> int:
             if checking and not learn:
                 plan.gate = lambda tree=tree, name=name: post_check(root, tree, name, cfg)
             rc = execute(plan)
-            denied = plan.egress_result.get("denied", {}) if rc == core.EXIT_EGRESS_DENIED else {}
-            hosts = sorted(h for h, v in denied.items()            # a port refusal can't be allowed
-                           if h not in plan.allow and not str(v.get("reason", "")).startswith("port "))
+            hosts = allowable(plan.egress_result, plan.allow) if rc == core.EXIT_EGRESS_DENIED else []
             if hosts:
                 suggest_allow(name, cfg, hosts)
             if rc != 0:
@@ -116,12 +114,19 @@ def cmd_fetch(args: list[str]) -> int:
     return 0
 
 
+def allowable(egress_result: dict, allow: list[str]) -> list[str]:
+    """Denied hosts an [allow] line could fix (a port refusal can't be allowed)."""
+    return sorted(h for h, v in egress_result.get("denied", {}).items()
+                  if h not in allow and not str(v.get("reason", "")).startswith("port "))
+
+
 def suggest_allow(eco: str, cfg: dict, denied: list[str]) -> None:
     """The exact [allow] line, keeping hosts already configured."""
     have = list(cfg.get("allow", {}).get(eco, []))
     hosts = ", ".join(f'"{h}"' for h in have + [d for d in denied if d not in have])
     say(f"  if expected, allow in {core.CONFIG_PATH}:  [allow]  {eco} = [{hosts}]")
-    say(f"  to see every host a fetch needs first: mvm fetch {eco} --learn")
+    if eco in ECOS:
+        say(f"  to see every host a fetch needs first: mvm fetch {eco} --learn")
 
 
 def pre_check(root: Path, eco: str, cfg: dict) -> int:
@@ -239,6 +244,29 @@ def cmd_run(args: list[str]) -> int:
     return execute(plan)
 
 
+def image_id(ref: str) -> str:
+    r = subprocess.run(["podman", "image", "inspect", "--format", "{{.Id}}", ref], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def cmd_pull(args: list[str]) -> int:
+    """Pull an image through the egress and pin it (a tag) or check it (a digest)."""
+    if len(args) != 1 or args[0].startswith("-"):
+        die("usage: mvm pull IMAGE   (registry/repo:tag or registry/repo@sha256:...)")
+    ref = args[0]
+    if "/" not in ref.split("@")[0].split(":")[0] or "." not in ref.split("/")[0]:
+        die(f"give the full name, registry included (e.g. docker.io/library/{ref})")
+    new = resolve_digest(ref, pull=True)
+    if "@" not in ref:
+        pins = read_json(pins_path(), {})
+        old = pins.get(ref, {}).get("ref")
+        if old != new:
+            pins[ref] = {"ref": new, "pinned_at": now_iso(), **({"previous": old} if old else {})}
+            write_json_atomic(pins_path(), pins)
+    say(f"pulled {ref} -> {new}")
+    return 0
+
+
 def cmd_update(args: list[str]) -> int:
     if args:
         die("update takes no arguments")
@@ -246,16 +274,29 @@ def cmd_update(args: list[str]) -> int:
     if not pins:
         say("nothing pinned yet")
         return 0
+    failed = 0
     for tag in sorted(pins):
         old = pins[tag]["ref"]
-        new = resolve_digest(tag, pull=True)
+        if tag.startswith("localhost/"):
+            print(f"{tag}: local build, not pulled")
+            continue
+        try:
+            new = resolve_digest(tag, pull=True)
+        except MvmError as e:
+            say(str(e))
+            failed += 1
+            continue
         if new != old:
+            # Pins made by plain podman pull name the multi-platform index; the same image
+            # re-pinned by its platform manifest is not a change.
+            same = image_id(new) == image_id(old) != ""
             pins[tag] = {"ref": new, "pinned_at": now_iso(), "previous": old}
-            print(f"{tag}: {old.split('@')[1][:19]} -> {new.split('@')[1][:19]}")
+            print(f"{tag}: {'unchanged (re-pinned by platform digest)' if same else ''}"
+                  f"{'' if same else old.split('@')[1][:19] + ' -> ' + new.split('@')[1][:19]}")
         else:
             print(f"{tag}: unchanged")
-    write_json_atomic(pins_path(), pins)
-    return 0
+        write_json_atomic(pins_path(), pins)
+    return 1 if failed else 0
 
 
 def human(n: float) -> str:
@@ -285,6 +326,9 @@ def cmd_status(args: list[str]) -> int:
         print(f"observer on but MISSING image {observer.OBSERVER_IMAGE}: fetch refuses to run (make observer)")
     for name in ECOS:
         print(f"  allow {name:<5} {', '.join(egress.allowlist(cfg, name))}")
+    why = pull.ready()
+    print(f"pull     {'MISSING: ' + why if why else 'images through the egress proxy (' + pull.SKOPEO_IMAGE + ')'}")
+    print(f"  allow pull  {', '.join(egress.allowlist(cfg, 'pull'))}")
     print(f"check    {'before every fetch' if check.before_fetch(cfg) else 'OFF before fetch'}"
           f" (osv-scanner {check.OSV_IMAGE.rsplit(':', 1)[1]}, MAL- advisories block)")
     print(f"notify   {'ntfy on trips' if check.notify_url(cfg) else 'off'}")
@@ -420,15 +464,16 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
   mvm check [--all]                    osv-scanner on the lockfiles (here, or every
                                        known project); also runs before every fetch
   mvm status                           config, checks, trips, pinned images, caches, runs
-  mvm update                           re-pull and re-pin images
+  mvm pull IMAGE                       pull an image (through the egress) and pin it
+  mvm update                           re-pull and re-pin images (through the egress)
   mvm cache rm NAME | grow NAME SIZE | gc
 
   -v       (first) verbose: per-run egress, observer and scanner details
   -w DIR   make ./DIR writable (the project is read-only otherwise)
   --it     interactive terminal
 
-fetch is the only command that downloads (check reaches only api.osv.dev), and the way
-out is a per-run allowlist proxy (Smokescreen): no DNS, no direct connections. It sees only the dependency manifests
+fetch downloads (check reaches only api.osv.dev; pull and update only registries), and
+the way out is a per-run allowlist proxy (Smokescreen): no DNS, no direct connections. It sees only the dependency manifests
 (go.mod, Cargo.toml, package.json and their lockfiles), never your sources, and
 only changed manifests are copied back. npm install scripts are skipped by
 default (run them offline: mvm build node -- npm rebuild).
@@ -458,7 +503,7 @@ def main(argv: list[str]) -> int:
         return 0
     signal.signal(signal.SIGTERM, _sigterm)
     cmds = {"fetch": cmd_fetch, "build": cmd_build, "run": cmd_run, "status": cmd_status, "check": cmd_check,
-            "update": cmd_update, "cache": cmd_cache}
+            "update": cmd_update, "pull": cmd_pull, "cache": cmd_cache}
     fn = cmds.get(argv[0])
     if fn is None:
         die(f"unknown command {argv[0]!r} (see mvm --help)")
@@ -468,5 +513,10 @@ def main(argv: list[str]) -> int:
         say("interrupted")
         return 130
     except (MvmError, subprocess.CalledProcessError) as e:
+        hosts = allowable(getattr(e, "egress", {}), egress.allowlist(load_config(), "pull"))
+        if hosts:                             # a held image pull
+            say(str(e))
+            suggest_allow("pull", load_config(), hosts)
+            return getattr(e, "rc", 1)
         die(str(e), 1)
         return 1

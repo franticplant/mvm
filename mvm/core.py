@@ -109,9 +109,9 @@ def load_config() -> dict:
         die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false")
     allow = cfg.get("allow", {})
     if not isinstance(allow, dict) or not all(
-            k in ECOS and isinstance(v, list) and all(valid_allow_host(h) for h in v)
+            k in (*ECOS, "pull") and isinstance(v, list) and all(valid_allow_host(h) for h in v)
             for k, v in allow.items()):
-        die(f"{CONFIG_PATH}: [allow] keys must be {sorted(ECOS)} with lists of host names")
+        die(f"{CONFIG_PATH}: [allow] keys must be {sorted((*ECOS, 'pull'))} with lists of host names")
     mask = cfg.get("mask", DEFAULT_MASK)
     if not isinstance(mask, list) or not all(isinstance(m, str) and m for m in mask):
         die(f"{CONFIG_PATH}: mask must be a list of non-empty strings")
@@ -157,9 +157,12 @@ def podman_out(args: list[str]) -> str:
 
 
 def resolve_digest(tag: str, pull: bool) -> str:
-    if pull or subprocess.run(["podman", "image", "exists", tag]).returncode != 0:
-        say(f"pulling {tag}")
-        subprocess.run(["podman", "pull", "-q", tag], check=True, stdout=subprocess.DEVNULL)
+    """repo@digest for tag; pulls (always confined, see pull.py) when asked or absent."""
+    if (pull and not tag.startswith("localhost/")) or subprocess.run(
+            ["podman", "image", "exists", tag]).returncode != 0:
+        from . import pull as confined
+        say(f"pulling {tag} (through the egress proxy)")
+        return confined.confined_pull(tag)
     digest = podman_out(["image", "inspect", "--format", "{{.Digest}}", tag])
     if not digest.startswith("sha256:"):
         raise MvmError(f"could not resolve digest for {tag}: {digest!r}")
@@ -172,7 +175,11 @@ def pinned(tag: str) -> str:
         return tag
     pins = read_json(pins_path(), {})
     if tag in pins:
-        return pins[tag]["ref"]
+        ref = pins[tag]["ref"]
+        if subprocess.run(["podman", "image", "exists", ref]).returncode != 0:
+            raise MvmError(f"{tag} is pinned to {ref}, which is no longer present locally "
+                           f"(removed?); pull and re-pin it: mvm pull {tag}")
+        return ref
     ref = resolve_digest(tag, pull=False)
     pins[tag] = {"ref": ref, "pinned_at": now_iso()}
     write_json_atomic(pins_path(), pins)

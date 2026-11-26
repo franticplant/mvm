@@ -44,6 +44,7 @@ class Plan:
     gate: Callable[[], str] | None = None   # runs before commit; a non-empty reason refuses it
     notify: str = ""          # ntfy URL: post when the run trips (held, failed proxy/observer, malicious)
     quiet: bool = False       # the command's own output is shown only when it fails (osv-scanner)
+    volumes: list[str] = field(default_factory=list)    # extra -v specs (pull: CA bundle, output dir)
 
 
 def new_run_id() -> str:
@@ -59,7 +60,8 @@ def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Pat
     """
     if plan.net and not net_args:
         raise core.MvmError("networked run without egress confinement")
-    argv = ["podman", "run", "--rm", "--runtime", "krun", "--memory", plan.memory,
+    # --pull=never: every image is pinned and present; a missing one must not be fetched unconfined.
+    argv = ["podman", "run", "--rm", "--pull=never", "--runtime", "krun", "--memory", plan.memory,
             "--name", f"mvm-{run_id}", "--label", f"mvm.run={run_id}",
             "--label", f"mvm.pid={os.getpid()}"]
     argv += net_args if plan.net else ["--network=none"]
@@ -76,6 +78,8 @@ def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Pat
             argv += ["-v", f"{empty_dir}:/src/{d}:ro,z"]
         for f in mfiles:
             argv += ["-v", f"/dev/null:/src/{f}:ro"]
+    for v in plan.volumes:
+        argv += ["-v", v]
     for k, v in sorted(plan.env.items()):
         argv += ["-e", f"{k}={v}"]
     lines = ["set -eu"]

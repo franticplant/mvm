@@ -29,6 +29,8 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .br
 .B mvm status
 .br
+.BI "mvm pull " IMAGE
+.br
 .B mvm update
 .br
 .B mvm cache
@@ -161,7 +163,27 @@ The first use of an image tag pins it to its digest in
 .IR ~/.local/state/mvm/pins.json ;
 later runs use the digest.
 .B mvm update
-re\-pulls every pinned tag and reports changes.
+re\-pulls every pinned tag and reports changes;
+.BI "mvm pull " IMAGE
+pulls and pins one (the full name, registry included).
+Every container mvm starts uses
+.BR \-\-pull=never :
+a pinned image missing locally fails the run instead of being fetched.
+.PP
+Pulls are confined like fetch: a static skopeo
+.RB ( "make skopeo" )
+is the only process of a microVM behind the egress proxy and observer, and
+copies the image into a
+.B dir:
+layout under
+.IR ~/.cache/mvm/pulls .
+Only after a clean run does the host load it offline
+.RB ( "podman pull dir:" ...,
+which re\-checks every blob) and pin it by the digest of its platform
+manifest; the download is then removed.
+A registry outside the allowlist holds the pull (exit 3).
+Built\-in registries: Docker Hub and GHCR; others with
+.BR "[allow] pull" .
 .SH FILES
 .TP
 .I ~/.config/mvm/config.toml
@@ -171,7 +193,7 @@ Optional:
 .B [images]
 (go, rust, node),
 .B [allow]
-(go, rust, node: lists of extra hosts for fetch),
+(go, rust, node: lists of extra hosts for fetch; pull: extra registry hosts),
 .B [memory]
 (go, rust, node, run),
 .B [observer]

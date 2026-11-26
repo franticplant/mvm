@@ -24,8 +24,18 @@ DEFAULT_ALLOW = {
     "go": ["proxy.golang.org", "sum.golang.org", "storage.googleapis.com"],
     "rust": ["index.crates.io", "static.crates.io"],
     "node": ["registry.npmjs.org"],
+    # Image pulls (mvm pull / update / first use). Docker Hub: auth, registry, and blobs
+    # from CloudFront (seen in a real run) or Cloudflare/R2 (Docker's published list; the
+    # one R2 bucket by name, never *.r2: any bucket would do for exfiltration). GHCR:
+    # registry and blobs. Other registries: [allow] pull = [...].
+    "pull": ["auth.docker.io", "registry-1.docker.io", "production.cloudfront.docker.com",
+             "production.cloudflare.docker.com",
+             "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
+             "ghcr.io", "pkg-containers.githubusercontent.com"],
 }
-PROXY_IMAGE = "docker.io/library/alpine:3.24"
+# alpine 3.24 by digest, the base of the firewall image (`make smokescreen` brings it):
+# by tag, a fresh machine would pull it through the very proxy it is about to run.
+PROXY_IMAGE = "docker.io/library/alpine@sha256:d56c381f961d307a21b3ca004cf1e3910f106644aefb1f43e654c8a56c4fd395"
 # Built by `make smokescreen` from the pinned alpine plus nftables; loads FIREWALL_SH.
 FIREWALL_IMAGE = "localhost/mvm-egress-fw:1"
 # Smokescreen allowlists host names but cannot restrict ports, so the proxy's own network
@@ -239,7 +249,7 @@ class Proxy:
         subprocess.run(["podman", "pod", "create", "--name", self.name, *labels,
                         "-p", f"127.0.0.1:{self.port}:{PROXY_PORT_IN_CONTAINER}"],
                        check=True, stdout=subprocess.DEVNULL)
-        fw = subprocess.run(["podman", "run", "--rm", "--pod", self.name, *labels,
+        fw = subprocess.run(["podman", "run", "--rm", "--pull=never", "--pod", self.name, *labels,
                              "--cap-drop=all", "--cap-add=NET_ADMIN", "--read-only",
                              "-v", f"{cfg}/firewall.sh:/firewall.sh:ro,z",
                              FIREWALL_IMAGE, "sh", "/firewall.sh"],
@@ -247,7 +257,7 @@ class Proxy:
         if fw.returncode != 0 or "MVM_EGRESS_FIREWALL_LOADED" not in fw.stdout:
             raise core.MvmError(f"egress port filter failed to load: {(fw.stderr or fw.stdout).strip()[:300]}")
         self.iface = next((ln[len("MVM_IF="):] for ln in fw.stdout.splitlines() if ln.startswith("MVM_IF=")), "")
-        argv = ["podman", "run", "-d", "--pod", self.name, "--name", f"{self.name}-smokescreen", *labels,
+        argv = ["podman", "run", "-d", "--pull=never", "--pod", self.name, "--name", f"{self.name}-smokescreen", *labels,
                 "--read-only", "--cap-drop=all", "--security-opt", "no-new-privileges",
                 "-v", f"{binary}:/smokescreen:ro,z", "-v", f"{cfg}:/cfg:ro,z",
                 image, "/smokescreen", "--config-file", "/cfg/config.yaml",

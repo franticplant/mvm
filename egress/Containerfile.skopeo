@@ -1,0 +1,4 @@
+# skopeo for confined image pulls: a static pure-Go build (`make skopeo`), nothing else.
+FROM scratch
+COPY skopeo /skopeo
+ENTRYPOINT []

@@ -7,6 +7,14 @@ SMOKESCREEN_REV ?= 5b4b7aabca9bc70a8435358d648edd03294c299e
 SMOKESCREEN_SRC ?= $(HOME)/.cache/mvm-src/smokescreen
 # nDPI 5.0 (ntop), the last all-LGPLv3 release, only as a black-box oracle for the observer's
 # real tests (`make ndpi-oracle`): from 6.0 its TLS dissector is ntop dual-licensed. Never take 6.x code.
+# skopeo for confined image pulls (`make skopeo`): a release tag at least two weeks old,
+# built offline by mvm from its vendored sources as a static pure-Go binary (no cgo, no gpgme,
+# no storage graph drivers), into a FROM scratch image.
+SKOPEO_TAG ?= v1.25.1
+SKOPEO_REV ?= 1fb351f23dbde474416ba33c3786a8d04304429b
+SKOPEO_SRC ?= $(HOME)/.cache/mvm-src/skopeo
+SKOPEO_TAGS = containers_image_openpgp containers_image_docker_daemon_stub containers_image_ostree_stub \
+	exclude_graphdriver_btrfs exclude_graphdriver_devicemapper exclude_graphdriver_overlay exclude_graphdriver_zfs
 NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/5.0.tar.gz
 NDPI_SHA256 ?= 8b0d3dc0c8a6a68578e09a18c922021ef6458d4aca1c7a20ce04efc267aa9ea5
 NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
@@ -15,7 +23,7 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test test-real lint smokescreen observer ndpi-oracle timer
+.PHONY: install uninstall test test-real lint smokescreen skopeo observer ndpi-oracle timer
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -61,6 +69,20 @@ smokescreen:
 	install -m 0755 "$(SMOKESCREEN_SRC)/out/smokescreen" "$(LIBDIR)/smokescreen"
 	podman build -q -t localhost/mvm-egress-fw:1 -f egress/Containerfile.firewall egress >/dev/null
 	@echo "Installed smokescreen $(SMOKESCREEN_REV) into $(LIBDIR) and built localhost/mvm-egress-fw:1"
+
+skopeo:
+	@test -d "$(SKOPEO_SRC)/.git" || git clone -q --filter=blob:none https://github.com/containers/skopeo.git "$(SKOPEO_SRC)"
+	git -C "$(SKOPEO_SRC)" cat-file -e "$(SKOPEO_REV)^{commit}" 2>/dev/null || git -C "$(SKOPEO_SRC)" fetch -q --depth 1 origin tag "$(SKOPEO_TAG)"
+	git -C "$(SKOPEO_SRC)" checkout -q --detach "$(SKOPEO_REV)"
+	test -d "$(SKOPEO_SRC)/vendor"
+	install -d "$(SKOPEO_SRC)/out"
+	@# Bootstrap: the Go image comes from plain podman pull here (later pulls need this skopeo).
+	img="$$(python3 -c 'import sys; sys.path.insert(0, "."); from mvm import ecos; print(ecos.ECOS["go"].image)')"; \
+		podman image exists "$$img" || podman pull -q "$$img" >/dev/null
+	cd "$(SKOPEO_SRC)" && "$(BINDIR)/mvm" build go -w out -- env CGO_ENABLED=0 go build -mod=vendor -trimpath \
+		-ldflags '-s -w' -tags '$(SKOPEO_TAGS)' -o out/skopeo ./cmd/skopeo
+	podman build -q -t localhost/mvm-skopeo:1 -f "$(CURDIR)/egress/Containerfile.skopeo" "$(SKOPEO_SRC)/out" >/dev/null
+	@echo "Built localhost/mvm-skopeo:1 (skopeo $(SKOPEO_TAG), static) for confined image pulls"
 
 observer:
 	podman pull -q "$$(python3 -c 'import sys; sys.path.insert(0, "."); from mvm import observer; print(observer.OBSERVER_IMAGE)')" >/dev/null

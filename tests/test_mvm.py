@@ -53,7 +53,7 @@ class _Facade:
 def load_mvm():
     sys.path.insert(0, str(REPO))
     import importlib
-    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "cli"]
+    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "pull", "cli"]
     mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
     # reload in dependency order so cross-module imports see fresh objects
     return _Facade(mods)
@@ -243,6 +243,60 @@ class PodmanArgvTests(Base):
         self.assertNotIn("--network=none", argv)
         self.assertIn("--dns=none", argv)
         self.assertIn("--network=pasta:-4,-o,127.0.0.1,--no-map-gw,-T,4321,--dns-host,192.0.2.1", argv)
+
+
+class PullTests(Base):
+    def test_every_podman_run_refuses_to_pull(self):
+        """An image missing locally must fail the run, never be pulled outside the egress."""
+        p = self.mvm.Plan(kind="pull", eco=None, image="localhost/mvm-skopeo:1", memory="1g", cmd=["/skopeo"],
+                          src=None, volumes=["/w/ca.crt:/etc/mvm/ca.crt:ro,z"])
+        argv = self.mvm.podman_argv(p, "RID", {}, Path("/e"))
+        self.assertIn("--pull=never", argv)
+        self.assertIn("/w/ca.crt:/etc/mvm/ca.crt:ro,z", argv)
+        self.assertEqual(argv[-2:], ["localhost/mvm-skopeo:1", "/skopeo"])          # PID 1, no shell
+        self.assertIn("--pull=never", self.mvm.observer.sidecar_argv("pod", "n", "r", "eth0", Path("/o")))
+        for mod in ("egress", "observer", "runtime"):
+            src = Path(REPO / "mvm" / f"{mod}.py").read_text()
+            self.assertEqual(src.count('"podman", "run"'), src.count('"podman", "run", "-d", "--pull=never"')
+                             + src.count('"podman", "run", "--rm", "--pull=never"'), mod)
+
+    def test_copy_argv_and_policy(self):
+        argv = self.mvm.pull.copy_argv("docker.io/library/alpine:3.24")
+        self.assertEqual(argv[0], "/skopeo")
+        self.assertEqual(argv[-2:], ["docker://docker.io/library/alpine:3.24", "dir:/out/img"])
+        pol = self.mvm.pull.POLICY
+        self.assertEqual(pol["default"], [{"type": "reject"}])
+        self.assertEqual(set(pol["transports"]), {"docker", "dir"})
+
+    def test_pull_allowlist(self):
+        allow = self.mvm.egress.allowlist({}, "pull")
+        self.assertIn("registry-1.docker.io", allow)
+        self.assertIn("production.cloudfront.docker.com", allow)        # seen in a real pull
+        self.assertFalse([h for h in allow if h.startswith("*.")])     # no wildcard (any R2 bucket)
+        self.mvm.CONFIG_PATH.write_text('[allow]\npull = ["quay.io", "cdn01.quay.io"]\n')
+        cfg = self.mvm.load_config()
+        self.assertIn("quay.io", self.mvm.egress.allowlist(cfg, "pull"))
+        self.mvm.CONFIG_PATH.write_text('[allow]\npulls = ["quay.io"]\n')
+        with self.assertRaises(SystemExit):
+            self.mvm.load_config()
+
+    def test_local_images_are_never_pulled(self):
+        with self.assertRaises(self.mvm.MvmError):
+            self.mvm.pull.confined_pull("localhost/mvm-skopeo:1", {})
+
+    def test_digest_is_of_the_manifest_bytes(self):
+        img = Path(self.tmp.name) / "img"
+        img.mkdir()
+        (img / "manifest.json").write_bytes(b'{"schemaVersion":2}')
+        self.assertEqual(self.mvm.pull.manifest_digest(img),
+                         "sha256:" + hashlib.sha256(b'{"schemaVersion":2}').hexdigest())
+
+    def test_missing_pinned_image_is_refused_not_pulled(self):
+        self.mvm.write_json_atomic(self.mvm.pins_path(), {"docker.io/x/y:1": {"ref": "docker.io/x/y@sha256:ab"}})
+        gone = subprocess.CompletedProcess([], 1)
+        with mock.patch.object(sys.modules["mvm.core"].subprocess, "run", return_value=gone):
+            with self.assertRaisesRegex(self.mvm.MvmError, "mvm pull docker.io/x/y:1"):
+                self.mvm.pinned("docker.io/x/y:1")
 
 
 class EgressTests(Base):
@@ -1116,6 +1170,28 @@ class RealTests(unittest.TestCase):
         r = subprocess.run(["/usr/sbin/debugfs", "-R", f"stat {path}", str(self.cache / f"{name}.img")],
                            capture_output=True, text=True)
         return "Inode:" in r.stdout
+
+    def test_confined_pull(self):
+        """Proves: an image pull goes through the proxy and observer, loads offline by digest,
+        runs; a registry outside the allowlist is held (exit 3) with the [allow] line."""
+        tag = "docker.io/library/busybox:1.37"
+        r = self.mvm("pull", tag)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ref = json.loads((Path(self.env["MVM_STATE_DIR"]) / "pins.json").read_text())[tag]["ref"]
+        self.assertIn(f"pulled {tag} -> {ref}", r.stderr)
+        rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
+        self.assertEqual((rec["kind"], rec["result"]), ("pull", "ok"))
+        self.assertIn("registry-1.docker.io", rec["egress"]["allowed"])
+        if self.observer_image():
+            self.assertTrue(rec["observer"]["healthy"])
+            self.assertEqual(rec["observer"]["outside_allowlist"], [])
+        self.assertEqual(list((self.cache / "pulls").iterdir()), [])        # the download is gone
+        r = self.mvm("run", "-i", tag, "--", "echo", "pulled-and-ran")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "pulled-and-ran"), r.stderr)
+        r = self.mvm("pull", "quay.io/prometheus/busybox:latest")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("HELD, nothing loaded", r.stderr)
+        self.assertIn('[allow]  pull = ["quay.io"]', r.stderr)
 
     def test_clean_commit(self):
         """Proves: a run that exits 0 commits its cache writes atomically and records the run."""

@@ -48,7 +48,7 @@ def image_present() -> bool:
 
 def sidecar_argv(pod: str, name: str, run_id: str, iface: str, out: Path, pcap: bool = False) -> list[str]:
     """The sensor parses untrusted packets: raw capture only, nothing else."""
-    return ["podman", "run", "-d", "--pod", pod, "--name", name,
+    return ["podman", "run", "-d", "--pull=never", "--pod", pod, "--name", name,
             "--label", f"mvm.run={run_id}", "--label", f"mvm.pid={os.getpid()}",
             "--cap-drop=all", "--cap-add=NET_RAW", "--security-opt", "no-new-privileges",
             "--read-only", "--memory", "256m", "--pids-limit", "64",

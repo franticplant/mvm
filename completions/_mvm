@@ -16,6 +16,7 @@ _mvm() {
     'run:run any image offline'
     'check:osv-scanner on lockfiles (here or --all)'
     'status:config, checks, trips, images, caches, runs'
+    'pull:pull an image through the egress and pin it'
     'update:re-pull and re-pin images'
     'cache:manage cache images'
   )
