@@ -119,6 +119,10 @@ In build and run, files and directories matching the mask list (default:
 are hidden: directories appear empty, files appear empty.
 .SH OPTIONS
 .TP
+.BR \-v ", " \-\-verbose
+Before the command: also print each run's egress and observer details, the
+scanner's output and the run record path.
+.TP
 .BI \-w " DIR"
 Make
 .I ./DIR
@@ -185,6 +189,9 @@ Last check result per project.
 .SH ENVIRONMENT
 .BR MVM_CACHE_DIR ", " MVM_STATE_DIR ", " MVM_CONFIG
 override the paths above.
+.B MVM_VERBOSE=1
+is the same as
+.BR \-v .
 .SH EXIT STATUS
 The command's exit status; 2 for usage errors; 130 when interrupted;
 3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
