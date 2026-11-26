@@ -65,8 +65,8 @@ def lockfile_empty(data: bytes, name: str) -> bool:
             d = json.loads(text)
         except ValueError:
             return False
-        return (isinstance(d, dict) and not d.get("dependencies")
-                and set(d.get("packages") or {}) <= {""})
+        pk = d.get("packages", {}) if isinstance(d, dict) else None
+        return isinstance(pk, dict) and set(pk) <= {""} and not d.get("dependencies")
     if name == "Cargo.lock":                     # strict substring checks: any doubt fails closed
         return "package" not in text
     if name == "go.mod":

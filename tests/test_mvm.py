@@ -551,6 +551,7 @@ class CheckTests(Base):
                                  (fresh.replace('}}}', '}, "node_modules/a": {"version": "1.0.0"}}}'), None, False),
                                  ('{"dependencies": {"a": {"version": "1.0.0"}}}', None, False),
                                  ("not json", None, False),
+                                 ('{"packages": [""]}', None, False),
                                  ('{"packages": {"": {}, "node_modules/a": {}}}', blank_it, False)):
             self.write("package-lock.json", lock)
             with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="osv@sha256:x"), \
