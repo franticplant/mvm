@@ -1,8 +1,8 @@
 """Observer for fetch: a passive nDPI (ndpiReader) sidecar in the egress proxy pod.
 
 It captures the pod's outbound leg, where the proxy relays the VM's own TLS
-ClientHello, and reports per flow the SNI, JA4 and bytes. Off by default; on with
-`[observer] enabled = true` in the host config. When on, it fails closed: a missing
+ClientHello, and reports per flow the SNI, JA4 and bytes. On by default (`[observer] enabled = false`
+in the host config turns it off). It fails closed: a missing
 image refuses the run, and a dead observer or unreadable output means nothing is
 committed. A TLS flow whose SNI is outside the allowlist (or has none) holds the run:
 the proxy only sees the CONNECT host, so this is what catches domain fronting.
@@ -33,7 +33,7 @@ DISCARDED_RE = re.compile(r"Discarded bytes:\s+(\d+)")
 
 
 def enabled(cfg: dict) -> bool:
-    return bool(cfg.get("observer", {}).get("enabled", False))
+    return bool(cfg.get("observer", {}).get("enabled", True))
 
 
 def image_present() -> bool:

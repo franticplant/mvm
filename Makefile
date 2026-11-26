@@ -5,7 +5,7 @@ LIBDIR ?= $(PREFIX)/lib/mvm
 # at least two weeks old; built offline by mvm itself from its vendored sources.
 SMOKESCREEN_REV ?= 5b4b7aabca9bc70a8435358d648edd03294c299e
 SMOKESCREEN_SRC ?= $(HOME)/.cache/mvm-src/smokescreen
-# nDPI (ntop) for the optional observer: release tarball pinned by sha256.
+# nDPI (ntop) for the observer (on by default; fetch refuses without its image): release tarball pinned by sha256.
 NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/6.0.tar.gz
 NDPI_SHA256 ?= 21fc40cab5505942c0b21d9bbaf73e9adf8162ddfe782e4cd072cab855a2eda9
 NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
@@ -66,7 +66,7 @@ observer:
 	@test -f "$(NDPI_SRC)/nDPI-6.0.tar.gz" || curl -fsSL -o "$(NDPI_SRC)/nDPI-6.0.tar.gz" "$(NDPI_URL)"
 	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-6.0.tar.gz" | sha256sum -c -
 	podman build -q -t localhost/mvm-observer:1 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
-	@echo "Built localhost/mvm-observer:1 (nDPI 6.0); enable it with [observer] enabled = true in ~/.config/mvm/config.toml"
+	@echo "Built localhost/mvm-observer:1 (nDPI 6.0) (the fetch observer, on by default)"
 
 # Daily `mvm check --all` (osv-scanner on every known project's lockfiles), as a user timer.
 timer:

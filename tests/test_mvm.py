@@ -186,9 +186,9 @@ class ConfigTests(Base):
         self.assertEqual(self.mvm.load_config()["mask"], [".env"])
 
     def test_observer_config(self):
-        self.assertFalse(self.mvm.observer.enabled(self.mvm.load_config()))     # off by default
-        self.mvm.CONFIG_PATH.write_text("[observer]\nenabled = true\n")
-        self.assertTrue(self.mvm.observer.enabled(self.mvm.load_config()))
+        self.assertTrue(self.mvm.observer.enabled(self.mvm.load_config()))      # on by default
+        self.mvm.CONFIG_PATH.write_text("[observer]\nenabled = false\n")
+        self.assertFalse(self.mvm.observer.enabled(self.mvm.load_config()))
 
     def test_wrong_shapes_rejected(self):
         for bad in ('mask = ".env"\n', 'mask = [""]\n', 'masks = []\n', '[images]\npython = "x"\n',

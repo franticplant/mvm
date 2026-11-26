@@ -71,9 +71,9 @@ outside the allowlist. Without the proxy binary
 .RI ( ~/.local/lib/mvm/smokescreen ", built by " "make smokescreen" ),
 fetch refuses to run.
 .PP
-With
-.B [observer] enabled = true
-in the config, a passive nDPI (ndpiReader) sidecar in the proxy pod records
+By default (off with
+.BR "[observer] enabled = false" ),
+a passive nDPI (ndpiReader) sidecar in the proxy pod records
 each outbound TLS flow's SNI, JA4 and bytes in the run record. A TLS name
 outside the allowlist, a flow without SNI, or non-TLS traffic on 443 holds the
 run (exit 3). The
@@ -170,7 +170,7 @@ Optional:
 .B [memory]
 (go, rust, node, run),
 .B [observer]
-(enabled = true|false, default false),
+(enabled = true|false, default true),
 .B [check]
 (before_fetch = true|false, default true),
 .B [notify]
