@@ -64,11 +64,18 @@ def _matches(host: str, allow: list[str]) -> bool:
     return False
 
 
+def _is_tls(proto: str) -> bool:
+    """nDPI names TLS flows "TLS" or "TLS.<app>" (e.g. TLS.Google)."""
+    return proto == "TLS" or proto.startswith("TLS.")
+
+
 def summarize(lines: list[str], allow: list[str]) -> dict:
     """Outbound TLS flows (dst port 443) from ndpiReader's JSON flow lines.
 
     `flows` keeps every flow (never keyed, so nothing is dropped); `outside_allowlist`
-    lists SNIs not covered by the allowlist, with "(no sni)" for a flow without one.
+    lists SNIs not covered by the allowlist, with "(no sni)" for a flow without one and
+    "(non-tls:PROTO)" for a flow on 443 that nDPI did not see as TLS (e.g. plaintext HTTP
+    with an allowed Host header sent through CONNECT): only TLS carries a checked SNI.
     """
     flows = []
     for line in lines:
@@ -85,7 +92,8 @@ def summarize(lines: list[str], allow: list[str]) -> dict:
                       "proto": n.get("proto", ""),
                       "bytes_out": int(x.get("src2dst_goodput_bytes", 0) or 0),
                       "bytes_in": int(x.get("dst2src_goodput_bytes", 0) or 0)})
-    outside = sorted({f["sni"] or "(no sni)" for f in flows if not f["sni"] or not _matches(f["sni"], allow)})
+    outside = sorted({f"(non-tls:{f['proto'] or 'unknown'})" for f in flows if not _is_tls(f["proto"])}
+                     | {f["sni"] or "(no sni)" for f in flows if not f["sni"] or not _matches(f["sni"], allow)})
     return {"flows": flows, "ja4": sorted({f["ja4"] for f in flows if f["ja4"]}), "outside_allowlist": outside}
 
 

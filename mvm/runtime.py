@@ -219,8 +219,8 @@ def execute(plan: Plan) -> int:
                     "Check the hosts with `mvm fetch --learn` and allow them in [allow] if expected")
             elif clean and sni_outside:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
-                say(f"{label}: TLS went to a name outside the allowlist (SNI {', '.join(sni_outside)}) "
-                    "although the proxy was asked for an allowed host: nothing committed")
+                say(f"{label}: traffic through the proxy was not TLS to an allowed name "
+                    f"({', '.join(sni_outside)}) although the proxy was asked for an allowed host: nothing committed")
             elif clean and plan.gate and (reason := plan.gate()):
                 result, rc = "malicious", core.EXIT_MALICIOUS
                 rec["gate"] = reason

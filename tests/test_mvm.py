@@ -419,6 +419,18 @@ class ObserverTests(Base):
         self.assertEqual(s["outside_allowlist"], [])
         self.assertIn("JA4 t13d3513h2", self.mvm.observer.summary_line(s))
 
+    def test_plaintext_on_443_is_held(self):
+        """Plaintext HTTP with an allowed Host header sent through CONNECT :443 has no TLS,
+        so no SNI was checked: nDPI reports proto HTTP with the Host as hostname."""
+        http = ('{"dest_ip":"142.250.1.1","dst_port":443,"ndpi":{"proto":"HTTP",'
+                '"hostname":"proxy.golang.org"},"xfer":{}}')
+        s = self.mvm.observer.summarize([http], ["proxy.golang.org"])
+        self.assertEqual(s["outside_allowlist"], ["(non-tls:HTTP)"])
+        app = self.REAL.replace('"proto":"TLS"', '"proto":"TLS.Cloudflare"')
+        unknown = self.REAL.replace('"proto":"TLS",', "")
+        s = self.mvm.observer.summarize([app, unknown, self.REAL], ["registry.npmjs.org"])
+        self.assertEqual(s["outside_allowlist"], ["(non-tls:unknown)"])   # TLS.<app> is TLS
+
     def test_sni_outside_allowlist_and_missing_sni(self):
         fronted = self.REAL.replace("registry.npmjs.org", "evil.example")
         no_sni = self.REAL.replace('"hostname":"registry.npmjs.org",', "")
@@ -527,6 +539,33 @@ class CheckTests(Base):
                 mock.patch.object(sys.modules["mvm.runtime"], "execute", return_value=0):
             with self.assertRaises(self.mvm.MvmError):         # exit 0 but no result file
                 self.mvm.check.scan_project(self.proj, "node", {})
+
+    def test_no_packages_exit_only_for_a_provably_empty_lockfile(self):
+        """osv-scanner exits 128 on a fresh `npm init` lockfile: that is 0 packages, not an
+        error, but only when the lockfile copied in really lists nothing."""
+        fresh = '{"name": "x", "lockfileVersion": 3, "requires": true, "packages": {"": {"name": "x"}}}'
+        def blank_it(plan):                        # the VM may rewrite its copy: never trusted
+            (plan.src / "package-lock.json").write_text(fresh)
+            return 128
+        for lock, effect, ok in ((fresh, None, True),
+                                 (fresh.replace('}}}', '}, "node_modules/a": {"version": "1.0.0"}}}'), None, False),
+                                 ('{"dependencies": {"a": {"version": "1.0.0"}}}', None, False),
+                                 ("not json", None, False),
+                                 ('{"packages": {"": {}, "node_modules/a": {}}}', blank_it, False)):
+            self.write("package-lock.json", lock)
+            with mock.patch.object(sys.modules["mvm.core"], "pinned", return_value="osv@sha256:x"), \
+                    mock.patch.object(sys.modules["mvm.runtime"], "execute", return_value=128, side_effect=effect):
+                if ok:
+                    s = self.mvm.check.scan_project(self.proj, "node", {})
+                    self.assertEqual((s["packages"], s["malicious"], s["lockfiles"]), (0, [], ["package-lock.json"]))
+                else:
+                    with self.assertRaises(self.mvm.MvmError, msg=lock):
+                        self.mvm.check.scan_project(self.proj, "node", {})
+        e = self.mvm.check.lockfile_empty
+        self.assertTrue(e(b"version = 3\n", "Cargo.lock"))
+        self.assertFalse(e(b'[[ package ]]\nname = "a"\n', "Cargo.lock"))
+        self.assertTrue(e(b"module x\n\ngo 1.22\n", "go.mod"))
+        self.assertFalse(e(b"module x\nrequire(\n a v1\n)\n", "go.mod"))
 
     def test_scanner_sees_only_lockfiles_and_osv(self):
         self.write("package-lock.json", "{}")

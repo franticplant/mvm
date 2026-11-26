@@ -27,6 +27,7 @@ OSV_ALLOW = ["api.osv.dev"]
 # Files osv-scanner reads per ecosystem (go.sum is not a lockfile it extracts).
 LOCKFILES = {"go": ["go.mod"], "rust": ["Cargo.lock"], "node": ["package-lock.json", "npm-shrinkwrap.json"]}
 OUT = ".mvm-osv.json"
+NO_PACKAGES = 128     # osv-scanner: "No package sources found" (e.g. a fresh `npm init` lockfile)
 TRIP_RESULTS = {"held", "proxy-failed", "observer-failed", "malicious"}
 
 
@@ -53,6 +54,24 @@ def _read_nofollow(path: Path, limit: int) -> bytes:
     if len(data) > limit:
         raise core.MvmError(f"{path.name}: larger than {limit} bytes")
     return data
+
+
+def lockfile_empty(data: bytes, name: str) -> bool:
+    """True only when the lockfile provably lists no dependency: osv-scanner's exit 128 is
+    accepted as "0 packages" only then, never for a lockfile it merely failed to read."""
+    text = data.decode("utf-8", "replace")
+    if name in ("package-lock.json", "npm-shrinkwrap.json"):
+        try:
+            d = json.loads(text)
+        except ValueError:
+            return False
+        return (isinstance(d, dict) and not d.get("dependencies")
+                and set(d.get("packages") or {}) <= {""})
+    if name == "Cargo.lock":                     # strict substring checks: any doubt fails closed
+        return "package" not in text
+    if name == "go.mod":
+        return "require" not in text
+    return False
 
 
 def parse(data: dict) -> dict:
@@ -98,16 +117,20 @@ def scan_tree(tree: Path, eco: str, cfg: dict, project: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix=f"mvm-check-{eco}-") as tmp:
         work = Path(tmp)
         from .project import MAX_MANIFEST
+        copied = {}                               # what the scanner got; work/ is VM-writable
         for rel in found:
             (work / rel).parent.mkdir(parents=True, exist_ok=True)
-            (work / rel).write_bytes(_read_nofollow(tree / rel, MAX_MANIFEST))
+            copied[rel] = _read_nofollow(tree / rel, MAX_MANIFEST)
+            (work / rel).write_bytes(copied[rel])
         plan = runtime.Plan(kind="check", eco=eco, image=core.pinned(OSV_IMAGE), memory="1g",
                             cmd=["scan", "source", "--recursive", "--all-packages", "--no-resolve",
                                  "--no-call-analysis=all", "--format", "json",
                                  "--output-file", f"/src/{OUT}", "/src"],
                             src=work, src_rw=True, net=True, allow=list(OSV_ALLOW), project=project,
-                            ok_exit=(0, 1), observe=observer.enabled(cfg), notify=notify_url(cfg))
+                            ok_exit=(0, 1, NO_PACKAGES), observe=observer.enabled(cfg), notify=notify_url(cfg))
         rc = runtime.execute(plan)
+        if rc == NO_PACKAGES and all(lockfile_empty(b, Path(r).name) for r, b in copied.items()):
+            return {"packages": 0, "malicious": [], "vulnerable": [], "lockfiles": found}
         if rc not in (0, 1):
             raise core.MvmError(f"dependency check failed (osv-scanner exit {rc}); "
                                 "set [check] before_fetch = false to fetch without it")

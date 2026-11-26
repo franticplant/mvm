@@ -75,7 +75,8 @@ With
 .B [observer] enabled = true
 in the config, a passive nDPI (ndpiReader) sidecar in the proxy pod records
 each outbound TLS flow's SNI, JA4 and bytes in the run record. A TLS name
-outside the allowlist, or a flow without SNI, holds the run (exit 3). The
+outside the allowlist, a flow without SNI, or non-TLS traffic on 443 holds the
+run (exit 3). The
 observer fails closed: without its image
 .RB ( "make observer" )
 fetch refuses to run; a dead observer, discarded frames, or a proxy connection
