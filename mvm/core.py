@@ -54,8 +54,17 @@ def die(msg: str, code: int = 2) -> None:
     sys.exit(code)
 
 
+VERBOSE = bool(os.environ.get("MVM_VERBOSE"))
+
+
 def say(msg: str) -> None:
     print(f"mvm: {msg}", file=sys.stderr)
+
+
+def detail(msg: str) -> None:
+    """Only with -v / MVM_VERBOSE=1 (the run record always has it)."""
+    if VERBOSE:
+        say(msg)
 
 
 def now_iso() -> str:

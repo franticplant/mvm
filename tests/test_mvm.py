@@ -861,7 +861,7 @@ class CommitTests(Base):
         self.img.write_bytes(b"ORIGINAL")
 
     def run_with(self, behaviour):
-        def fake(argv):
+        def fake(argv, *_a, **_k):
             # the mounted image is the run copy, never the real cache
             src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
             self.assertIn(".img.run-", src)
@@ -912,7 +912,7 @@ class CommitTests(Base):
         self.mvm.LIB_DIR.mkdir()
         (self.mvm.LIB_DIR / "smokescreen").write_text("")       # present; the proxy itself is faked
         with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy):
-            def fake(argv):
+            def fake(argv, *_a, **_k):
                 src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
                 Path(src).write_bytes(b"LEARNED")
                 return 0
@@ -941,7 +941,7 @@ class CommitTests(Base):
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
         self.mvm.LIB_DIR.mkdir(exist_ok=True)
         (self.mvm.LIB_DIR / "smokescreen").write_text("")
-        def fake(argv):
+        def fake(argv, *_a, **_k):
             src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
             Path(src).write_bytes(b"WRITTEN")
             return 0
@@ -1017,7 +1017,7 @@ class CommitTests(Base):
         self.assertEqual(self.img.read_bytes(), b"WRITTEN")
 
     def _gated(self, gate=None, rc=0, ok_exit=(0,), notify=""):
-        def fake(argv):
+        def fake(argv, *_a, **_k):
             src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
             Path(src).write_bytes(b"WRITTEN")
             return rc
@@ -1185,7 +1185,9 @@ class RealTests(unittest.TestCase):
         self.assertEqual(rec["result"], "held")
         self.assertIn("example.com", rec["egress"]["denied"])
         self.assertIn("proxy.golang.org", rec["egress"]["allowed"])
-        self.assertIn("DENIED: example.com", r.stderr)
+        self.assertIn("tried hosts that are not allowed: example.com, proxy.golang.org (port 22 blocked", r.stderr)
+        self.assertIn('[allow]  go = ["example.com"]', r.stderr)          # the exact line; never a port refusal
+        self.assertNotIn("egress allowed:", r.stderr)                     # details only with -v
 
     FRONT_GO = r"""package main
 
@@ -1236,7 +1238,8 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         self.assertEqual(rec["observer"]["outside_allowlist"], ["example.com"])
         self.assertEqual(sorted({f["sni"] for f in rec["observer"]["flows"]}), ["example.com", "proxy.golang.org"])
         self.assertTrue(all(f["ja4"] for f in rec["observer"]["flows"]))
-        self.assertIn("SNI OUTSIDE THE ALLOWLIST: example.com", r.stderr)
+        self.assertIn("HELD, nothing committed: through a tunnel to an allowed host it sent TLS to example.com",
+                      r.stderr)
 
     def test_sensor_matches_ndpi_on_real_fetches(self):
         """Proves: on real go, rust and node fetches (registry clients' own ClientHellos,
@@ -1400,9 +1403,10 @@ func main() { tunnel(false); tunnel(true) }
         r = self.mvm("check")
         self.assertEqual(r.returncode, 0, r.stderr)                     # control: clean
         self.assertIn("1 package(s), no known vulnerabilities", r.stdout)
+        self.assertNotIn("Scanning dir", r.stdout + r.stderr)            # scanner chatter only on failure
         lock["packages"]["node_modules/flatmap-stream"] = {"version": "0.1.1"}
         (self.proj / "package-lock.json").write_text(json.dumps(lock))
-        r = self.mvm("check")
+        r = self.mvm("-v", "check")
         self.assertEqual(r.returncode, 6, r.stderr)
         self.assertIn("MAL-2025-20690", r.stdout)
         self.assertIn("egress allowed: api.osv.dev", r.stderr)

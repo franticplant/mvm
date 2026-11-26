@@ -127,7 +127,8 @@ def scan_tree(tree: Path, eco: str, cfg: dict, project: Path) -> dict:
                                  "--no-call-analysis=all", "--format", "json",
                                  "--output-file", f"/src/{OUT}", "/src"],
                             src=work, src_rw=True, net=True, allow=list(OSV_ALLOW), project=project,
-                            ok_exit=(0, 1, NO_PACKAGES), observe=observer.enabled(cfg), notify=notify_url(cfg))
+                            ok_exit=(0, 1, NO_PACKAGES), observe=observer.enabled(cfg), notify=notify_url(cfg),
+                            quiet=True)
         rc = runtime.execute(plan)
         if rc == NO_PACKAGES and all(lockfile_empty(b, Path(r).name) for r, b in copied.items()):
             return {"packages": 0, "malicious": [], "vulnerable": [], "lockfiles": found}

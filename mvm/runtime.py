@@ -7,6 +7,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -42,6 +43,7 @@ class Plan:
     ok_exit: tuple[int, ...] = (0,)   # exit codes that count as clean (osv-scanner: 1 = findings)
     gate: Callable[[], str] | None = None   # runs before commit; a non-empty reason refuses it
     notify: str = ""          # ntfy URL: post when the run trips (held, failed proxy/observer, malicious)
+    quiet: bool = False       # the command's own output is shown only when it fails (osv-scanner)
 
 
 def new_run_id() -> str:
@@ -94,8 +96,30 @@ def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Pat
     return argv + ["sh", "-c", "\n".join(lines)]
 
 
-def run_podman(argv: list[str]) -> int:
-    return subprocess.run(argv).returncode
+def run_podman(argv: list[str], quiet: bool = False, ok: tuple[int, ...] = (0,)) -> int:
+    if not quiet or core.VERBOSE:
+        return subprocess.run(argv).returncode
+    with tempfile.TemporaryFile() as log:
+        rc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT).returncode
+        if rc not in ok:
+            log.seek(0)
+            sys.stderr.write(log.read().decode(errors="replace")[-4000:])
+    return rc
+
+
+def held_reason(items: list[str]) -> str:
+    """The observer's outside_allowlist entries, in words."""
+    words = []
+    for x in items:
+        if x == "(non-tls)":
+            words.append("a connection that was not TLS")
+        elif x == "(no sni)":
+            words.append("TLS without a host name")
+        elif x.startswith("(fault: "):
+            words.append(x[8:-1])
+        else:
+            words.append(f"TLS to {x}")
+    return ", ".join(words)
 
 
 def kill_container(run_id: str) -> None:
@@ -142,6 +166,18 @@ def prune_records() -> None:
         old.unlink(missing_ok=True)
 
 
+def traffic(rec: dict) -> str:
+    eg = rec.get("egress") if isinstance(rec.get("egress"), dict) else {}
+    if eg.get("mode") != "enforce":
+        return ""
+    allowed = eg.get("allowed", {})
+    if not allowed:
+        return " (no downloads)"
+    n = sum(int(v.get("bytes_in", 0)) for v in allowed.values())
+    size = next(f"{n / 1024 ** i:.1f} {u}" for i, u in enumerate(("B", "KiB", "MiB", "GiB")) if n < 1024 ** (i + 1) or u == "GiB")
+    return f" ({size} from {', '.join(sorted(allowed))})"
+
+
 def execute(plan: Plan) -> int:
     if plan.net and not egress.smokescreen_bin().is_file():
         # Fail closed before touching caches or writing a record.
@@ -185,14 +221,14 @@ def execute(plan: Plan) -> int:
                         ob = stack.enter_context(observer.Observer(run_id, px.name, px.iface, plan.allow))
                 argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
                 try:
-                    rc = run_podman(argv)
+                    rc = run_podman(argv, plan.quiet, plan.ok_exit)
                 except KeyboardInterrupt:
                     kill_container(run_id)
                     raise
             if plan.net:                      # the proxy has stopped: its log is complete
                 rec["egress"].update(px.summary, proxy_healthy=px.healthy)
                 plan.egress_result = rec["egress"]
-                say(f"{label}: {egress.summary_line(px.summary)}")
+                core.detail(f"{label}: {egress.summary_line(px.summary)}")
                 if plan.observe:
                     missed = observer.unobserved(ob.summary, px.summary)
                     if missed:
@@ -201,7 +237,7 @@ def execute(plan: Plan) -> int:
                     rec["observer"] = {**ob.summary, "healthy": ob.healthy, "unobserved_connections": missed,
                                        "capture": getattr(ob, "stats", None)}
                     plan.egress_result = {**rec["egress"], "observer": rec["observer"]}
-                    say(f"{label}: {observer.summary_line(ob.summary)}")
+                    core.detail(f"{label}: {observer.summary_line(ob.summary)}")
             observed_ok = not (plan.net and plan.observe) or ob.healthy
             sni_outside = plan.net and plan.observe and ob.summary["outside_allowlist"]
             clean = rc in plan.ok_exit
@@ -215,12 +251,13 @@ def execute(plan: Plan) -> int:
                 say(f"{label}: the observer died or its flows were unreadable; nothing committed")
             elif clean and plan.net and px.summary["denied"]:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
-                say(f"{label}: egress was denied, so this run is not trusted: nothing committed. "
-                    "Check the hosts with `mvm fetch --learn` and allow them in [allow] if expected")
+                say(f"{label}: HELD, nothing committed: it tried hosts that are not allowed: " + ", ".join(
+                    f"{h} ({v['reason']})" if str(v.get("reason", "")).startswith("port ") else h
+                    for h, v in sorted(px.summary["denied"].items())))
             elif clean and sni_outside:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
-                say(f"{label}: traffic through the proxy was not TLS to an allowed name "
-                    f"({', '.join(sni_outside)}) although the proxy was asked for an allowed host: nothing committed")
+                say(f"{label}: HELD, nothing committed: through a tunnel to an allowed host it sent "
+                    f"{held_reason(sni_outside)} (possible fronting or tunnelling)")
             elif clean and plan.gate and (reason := plan.gate()):
                 result, rc = "malicious", core.EXIT_MALICIOUS
                 rec["gate"] = reason
@@ -242,9 +279,10 @@ def execute(plan: Plan) -> int:
         prune_records()
         if result == "committed":
             gens = ", ".join(f"{k} gen {v}" for k, v in rec["generations"].items())
-            say(f"{label}: committed {gens} (run {run_id})")
-        elif copies:
-            say(f"{label}: {result}, exit {rc}, cache writes discarded (run {run_id})")
+            say(f"{label}: committed {gens}{traffic(rec)}")
+        elif copies and result not in ("held", "malicious", "proxy-failed", "observer-failed"):
+            say(f"{label}: {result}, exit {rc}, nothing committed")      # those said why already
+        core.detail(f"{label}: run {run_id}: {record_path(run_id)}")
         if result in check.TRIP_RESULTS and plan.notify:
             check.notify(plan.notify, f"mvm {label}: {result}",
                          f"{label} in {Path(rec['cwd']).name}: {result}, exit {rc} (run {run_id})")

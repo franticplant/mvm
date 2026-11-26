@@ -97,6 +97,11 @@ def cmd_fetch(args: list[str]) -> int:
             if checking and not learn:
                 plan.gate = lambda tree=tree, name=name: post_check(root, tree, name, cfg)
             rc = execute(plan)
+            denied = plan.egress_result.get("denied", {}) if rc == core.EXIT_EGRESS_DENIED else {}
+            hosts = sorted(h for h, v in denied.items()            # a port refusal can't be allowed
+                           if h not in plan.allow and not str(v.get("reason", "")).startswith("port "))
+            if hosts:
+                suggest_allow(name, cfg, hosts)
             if rc != 0:
                 return rc
             if learn:
@@ -111,11 +116,19 @@ def cmd_fetch(args: list[str]) -> int:
     return 0
 
 
+def suggest_allow(eco: str, cfg: dict, denied: list[str]) -> None:
+    """The exact [allow] line, keeping hosts already configured."""
+    have = list(cfg.get("allow", {}).get(eco, []))
+    hosts = ", ".join(f'"{h}"' for h in have + [d for d in denied if d not in have])
+    say(f"  if expected, allow in {core.CONFIG_PATH}:  [allow]  {eco} = [{hosts}]")
+    say(f"  to see every host a fetch needs first: mvm fetch {eco} --learn")
+
+
 def pre_check(root: Path, eco: str, cfg: dict) -> int:
     """osv-scanner on the project's lockfile before any download; a malicious package stops it."""
     s = check.scan_project(root, eco, cfg)
     check.record(root, eco, s)
-    say(f"{eco}: {check.summary_line(s)}")
+    say(f"check {eco}: {check.summary_line(s).removeprefix('check: ')}")
     if s["malicious"]:
         names = ", ".join(f"{m['package']}@{m['version']}" for m in s["malicious"])
         check.notify(check.notify_url(cfg), f"mvm fetch {eco}: malicious dependency",
@@ -131,7 +144,7 @@ def post_check(root: Path, tree: Path, eco: str, cfg: dict) -> str:
     if not any(Path(rel).name in names for rel in changed_manifests(root, tree, ECOS[eco])):
         return ""
     s = check.scan_tree(tree, eco, cfg, root)
-    say(f"{eco}: new lockfile {check.summary_line(s)}")
+    say(f"check {eco}: new lockfile: {check.summary_line(s).removeprefix('check: ')}")
     if not s["malicious"]:
         return ""
     return "the new lockfile pins a known malicious package (" + ", ".join(
@@ -312,9 +325,9 @@ def cmd_status(args: list[str]) -> int:
     if leftovers:
         print(f"  {len(leftovers)} leftover run copies (mvm cache gc removes them)")
     print("\nrecent runs")
-    recs = sorted((core.STATE_ROOT / "runs").glob("*.json"))[-10:]
-    for p in recs:
-        r = read_json(p, {})
+    recs = [(p, r) for p in sorted((core.STATE_ROOT / "runs").glob("*.json"))
+            if (r := read_json(p, {})).get("kind") != "check"][-10:]      # checks: see "checks" above
+    for p, r in recs:
         cmd = " ".join(r.get("cmd", []))
         eg = r.get("egress") if isinstance(r.get("egress"), dict) else {}
         denied = eg.get("denied", {})
@@ -410,6 +423,7 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
   mvm update                           re-pull and re-pin images
   mvm cache rm NAME | grow NAME SIZE | gc
 
+  -v       (first) verbose: per-run egress, observer and scanner details
   -w DIR   make ./DIR writable (the project is read-only otherwise)
   --it     interactive terminal
 
@@ -436,6 +450,9 @@ def _sigterm(*_):
 
 
 def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("-v", "--verbose"):
+        core.VERBOSE = True
+        argv = argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(USAGE, end="")
         return 0
