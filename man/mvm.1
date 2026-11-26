@@ -20,6 +20,8 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .I IMAGE
 .RB [ \-u
 .IR USER ]
+.RB [ \-p
+.IR HOST:CONT ]
 .RB [ \-w
 .IR DIR ]
 .RB [ \-\-it ]
@@ -163,6 +165,24 @@ Files it writes there are owned by a subordinate uid on the host (remove them wi
 and
 .B fetch
 always run as guest root: they loop\-mount the caches.
+.TP
+.BR \-p ", " \-\-publish " \fIHOST:CONT\fR"
+.B run
+only, repeatable: serve the guest's port
+.I CONT
+on host
+.RI 127.0.0.1: HOST
+(also written
+.IR 127.0.0.1:HOST:CONT ;
+any other bind address is refused), e.g. a dev server. The microVM runs in a
+.B \-\-network=none
+pod, whose namespace has only loopback, so it can open no connection at all (internet,
+DNS, LAN, tailnet, or the host). mvm listens on the host port and splices each
+connection to a Unix socket that a read\-only, no\-capability sidecar in the pod
+.RB ( portbridge.py ,
+in the pinned observer image:
+.BR "make observer" )
+forwards to 127.0.0.1:\fICONT\fR. The server must listen on 0.0.0.0 or 127.0.0.1.
 .SH CACHES AND COMMIT-ON-CLEAN
 Caches are sparse ext4 image files in
 .IR ~/.cache/mvm ,
@@ -294,6 +314,7 @@ mvm build \-w build \-\- go build \-o build/app ./cmd/app
 mvm build node \-\- npm rebuild
 mvm run \-i docker.io/library/alpine:3.24 \-\- uname \-a
 mvm run \-u 1000:1000 \-i docker.io/library/alpine:3.24 \-\- id
+mvm run \-p 8080:80 \-i docker.io/library/nginx:alpine \-\- nginx \-g 'daemon off;'
 mvm pull ghcr.io/astral\-sh/ruff:0.8.4\-alpine
 mvm image build \-t localhost/jq:1 \-f Containerfile
 .fi

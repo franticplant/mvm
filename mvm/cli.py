@@ -22,7 +22,7 @@ USER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)
 
 
 def parse_opts(args: list[str], allow_image: bool) -> tuple[dict, list[str]]:
-    opts: dict = {"writable": [], "interactive": False, "image": None, "user": "", "positional": []}
+    opts: dict = {"writable": [], "interactive": False, "image": None, "user": "", "ports": [], "positional": []}
     i = 0
     while i < len(args):
         a = args[i]
@@ -43,6 +43,15 @@ def parse_opts(args: list[str], allow_image: bool) -> tuple[dict, list[str]]:
             if not USER_RE.fullmatch(args[i + 1]):
                 die(f"bad user {args[i + 1]!r}: give NAME, UID, NAME:GROUP or UID:GID")
             opts["user"] = args[i + 1]
+            i += 2
+        elif allow_image and a in ("-p", "--publish") and i + 1 < len(args):
+            try:
+                port = egress.parse_port(args[i + 1])
+            except MvmError as e:
+                die(str(e))
+            if port[0] in (h for h, _ in opts["ports"]):
+                die(f"host port {port[0]} given twice")
+            opts["ports"].append(port)
             i += 2
         elif a.startswith("-"):
             die(f"unknown option {a!r} (see mvm --help)")
@@ -243,14 +252,15 @@ def cmd_build(args: list[str]) -> int:
 def cmd_run(args: list[str]) -> int:
     opts, cmd = parse_opts(args, allow_image=True)
     if not opts["image"] or opts["positional"]:
-        die("usage: mvm run -i IMAGE [-u USER] [-w DIR] [--it] -- CMD")
+        die("usage: mvm run -i IMAGE [-u USER] [-p HOST:CONT] [-w DIR] [--it] -- CMD")
     root = Path.cwd().resolve()
     cfg = load_config()
     plan = Plan(kind="run", eco=None, image=pinned(opts["image"]),
                 memory=memory_for(cfg, "run", "2g"), cmd=cmd, src=root,
                 writable=check_writable(root, opts["writable"]),
                 masks=find_masks(root, cfg.get("mask", DEFAULT_MASK)),
-                interactive=opts["interactive"], project=root, user=opts["user"])
+                interactive=opts["interactive"], project=root, user=opts["user"],
+                ports=opts["ports"])
     return execute(plan)
 
 
@@ -494,8 +504,8 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
                                        --learn: allow but log every host, commit nothing
   mvm build [go|rust|node] [-w DIR] [--it] -- CMD
                                        build offline against the fetched caches
-  mvm run -i IMAGE [-u USER] [-w DIR] [--it] -- CMD
-                                       run any image offline
+  mvm run -i IMAGE [-u USER] [-p HOST:CONT] [-w DIR] [--it] -- CMD
+                                       run any image offline (-p: inbound on 127.0.0.1 only)
   mvm check [--all]                    osv-scanner on the lockfiles (here, or every
                                        known project); also runs before every fetch
   mvm status                           config, checks, trips, pinned images, caches, runs

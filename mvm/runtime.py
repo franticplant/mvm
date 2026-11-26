@@ -50,6 +50,7 @@ class Plan:
     l7: dict | None = None              # pulls: l7proxy policy + upstream roots (see egress.Proxy)
     l7_ca: Path | None = None           # where the run's ephemeral CA certificate goes, for the guest
     user: str = ""            # run only: podman --user (build/fetch need guest root to loop-mount caches)
+    ports: list[tuple[int, int]] = field(default_factory=list)   # run only: (host, cont), 127.0.0.1 inbound
 
 
 def new_run_id() -> str:
@@ -57,7 +58,7 @@ def new_run_id() -> str:
 
 
 def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Path,
-                net_args: list[str] | None = None) -> list[str]:
+                net_args: list[str] | None = None, pod: str | None = None) -> list[str]:
     """Build the podman command. `mounts` maps cache name -> image file to attach.
 
     A networked plan must come with `net_args` (the confined pasta network); there is
@@ -69,7 +70,12 @@ def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Pat
     argv = ["podman", "run", "--rm", "--pull=never", "--runtime", "krun", "--memory", plan.memory,
             "--name", f"mvm-{run_id}", "--label", f"mvm.run={run_id}",
             "--label", f"mvm.pid={os.getpid()}"]
-    argv += net_args if plan.net else ["--network=none"]
+    if plan.ports:
+        if plan.kind != "run" or plan.net or not pod:
+            raise core.MvmError("published ports are only for mvm run, in its --network=none port pod")
+        argv += ["--pod", pod]             # --network=none pod (lo only); inbound via the Unix socket bridge
+    else:
+        argv += net_args if plan.net else ["--network=none"]
     if plan.user:
         if plan.kind != "run" or plan.caches:
             raise core.MvmError("--user is only for mvm run (caches are mounted as guest root)")
@@ -209,6 +215,7 @@ def execute(plan: Plan) -> int:
            "cmd": plan.cmd, "cwd": str(project or Path.cwd()), "started_at": now_iso(),
            "egress": {"mode": mode, "allow": plan.allow if plan.net else []},
            "observer": "on" if plan.net and plan.observe else "off",
+           **({"ports": [f"127.0.0.1:{h}:{c}" for h, c in plan.ports]} if plan.ports else {}),
            "caches": {c.name: ("rw" if c.rw else "ro") for c in plan.caches}}
     write_json_atomic(record_path(run_id), rec)
 
@@ -225,6 +232,9 @@ def execute(plan: Plan) -> int:
                 mounts[c.name] = copies.get(c.name, cache_img(c.name))
             with contextlib.ExitStack() as stack:
                 net_args = None
+                pod = None
+                if plan.ports:
+                    pod = stack.enter_context(egress.InboundPod(run_id, plan.ports)).name
                 if plan.net:
                     px = stack.enter_context(
                         egress.Proxy(run_id, plan.allow, "report" if plan.learn else "enforce", plan.l7))
@@ -239,7 +249,7 @@ def execute(plan: Plan) -> int:
                         raise core.MvmError("argv_fn needs the confined network")
                     argv = plan.argv_fn(net_args, px.port)
                 else:
-                    argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
+                    argv = podman_argv(plan, run_id, mounts, Path(empty), net_args, pod)
                 try:
                     rc = run_podman(argv, plan.quiet, plan.ok_exit)
                 except KeyboardInterrupt:

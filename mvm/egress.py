@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -152,6 +153,109 @@ def acl_yaml(hosts: list[str], action: str) -> str:
 
 
 CONFIG_YAML = "allow_missing_role: true\nacl_file: /cfg/acl.yaml\n"
+
+
+def parse_port(spec: str) -> tuple[int, int]:
+    """-p HOST:CONT or 127.0.0.1:HOST:CONT -> (host, cont). Any other bind address is
+    refused: published ports are host-loopback only."""
+    parts = spec.split(":")
+    if len(parts) == 3 and parts[0] == "127.0.0.1":
+        parts = parts[1:]
+    if len(parts) != 2 or not all(p.isascii() and p.isdigit() and 1 <= int(p) <= 65535 for p in parts):
+        raise core.MvmError(f"bad port {spec!r}: give HOST:CONT (1-65535), published on 127.0.0.1 only")
+    return int(parts[0]), int(parts[1])
+
+
+def inbound_pod_argv(name: str, labels: list[str]) -> list[str]:
+    """The workload's pod: --network=none, so its namespace has only loopback."""
+    return ["podman", "pod", "create", "--name", name, *labels, "--network=none"]
+
+
+def bridge_argv(pod: str, labels: list[str], sockdir: str, script: str, image: str, conts: list[int]) -> list[str]:
+    """The pod-side bridge: no capabilities, read-only, only the socket dir writable."""
+    return ["podman", "run", "-d", "--pull=never", "--pod", pod, "--name", f"{pod}-bridge", *labels,
+            "--cap-drop=all", "--security-opt", "no-new-privileges", "--read-only",
+            "-v", f"{sockdir}:/sock:z", "-v", f"{script}:/portbridge.py:ro,z",
+            image, "python3", "-I", "-B", "/portbridge.py", "/sock", *[str(c) for c in conts]]
+
+
+class InboundPod:
+    """mvm run -p: the workload runs in a --network=none pod (loopback only, so it can open
+    no connection to anything); inbound connections reach it through Unix sockets that a
+    pod-side bridge forwards to 127.0.0.1:CONT, and mvm splices host 127.0.0.1:HOST to them."""
+
+    def __init__(self, run_id: str, ports: list[tuple[int, int]]):
+        self.run_id, self.ports = run_id, ports
+        self.name = f"mvm-ports-{run_id}"
+        self._dir: str | None = None
+        self._listeners: list[socket.socket] = []
+
+    def __enter__(self) -> InboundPod:
+        from . import observer, portbridge
+        if not observer.image_present():
+            raise core.MvmError("the Python image for the port bridge is missing (run `make observer` in the "
+                                "mvm repo); mvm run -p refuses to run without it")
+        labels = ["--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}"]
+        try:
+            self._dir = tempfile.mkdtemp(prefix="mvm-ports-")
+            os.chmod(self._dir, 0o700)
+            if len(os.path.join(self._dir, portbridge.sock_name(65535))) > 100:
+                raise core.MvmError(f"temp dir path too long for a Unix socket: {self._dir} (set TMPDIR)")
+            for host, _ in self.ports:          # bind first: a busy port fails before any pod exists
+                ln = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                ln.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    ln.bind(("127.0.0.1", host))
+                except OSError as e:
+                    ln.close()
+                    raise core.MvmError(f"host port 127.0.0.1:{host}: {e.strerror}") from None
+                ln.listen(64)
+                self._listeners.append(ln)
+            r = subprocess.run(inbound_pod_argv(self.name, labels), capture_output=True, text=True)
+            if r.returncode != 0:
+                raise core.MvmError(f"could not create the port pod: {r.stderr.strip()}")
+            conts = sorted({c for _, c in self.ports})
+            r = subprocess.run(bridge_argv(self.name, labels, self._dir, portbridge.__file__,
+                                           observer.OBSERVER_IMAGE, conts),
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise core.MvmError(f"could not start the port bridge: {r.stderr.strip()}")
+            socks = [Path(self._dir) / portbridge.sock_name(c) for c in conts]
+            deadline = time.monotonic() + 15
+            while not all(p.is_socket() for p in socks):
+                if time.monotonic() > deadline:
+                    raise core.MvmError("the port bridge did not come up")
+                time.sleep(0.1)
+            for ln, (_, cont) in zip(self._listeners, self.ports):
+                path = str(Path(self._dir) / portbridge.sock_name(cont))
+
+                def dial(path=path):
+                    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        u.connect(path)
+                    except OSError:
+                        u.close()
+                        raise
+                    return u
+                threading.Thread(target=portbridge.serve, args=(ln, dial), daemon=True).start()
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for ln in self._listeners:
+            try:
+                ln.shutdown(socket.SHUT_RDWR)  # wakes the accept() in the serving thread
+            except OSError:
+                pass
+            ln.close()
+        self._listeners = []
+        subprocess.run(["podman", "pod", "rm", "-f", "-t", "0", self.name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self._dir:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
 
 
 def free_port() -> int:

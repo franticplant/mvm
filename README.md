@@ -10,6 +10,7 @@ mvm build -w build -- go build -o build/app ./cmd/app   # offline from here on
 mvm build rust -- cargo test
 mvm run -i docker.io/library/alpine:3.24 -- uname -a
 mvm run -u 1000:1000 -i IMAGE -- CMD             # as a non-root user (e.g. Chromium's sandbox)
+mvm run -p 8080:80 -i docker.io/library/nginx:alpine -- nginx -g 'daemon off;'   # dev server on 127.0.0.1:8080, no egress
 mvm pull ghcr.io/astral-sh/ruff:0.8.4-alpine     # confined image pull, pinned by digest
 mvm image build -t localhost/jq:1 -f Containerfile   # RUN steps in krun, OS mirrors only
 ```
@@ -22,7 +23,7 @@ The networked steps are `fetch`, `check`, `pull`/`update` and `image build`, eac
 |---|---|---|---|
 | `mvm fetch [go\|rust\|node] [-- CMD]` | yes | **only** `go.mod`/`go.sum`, `Cargo.toml`/`Cargo.lock`, `package.json`/`package-lock.json` (Cargo targets as empty stubs) | dependency caches; changed manifests are copied back |
 | `mvm build [go\|rust\|node] -- CMD` | no | the project, read-only, with `.git`, `.env*` and key files hidden | build caches, `node_modules`, and `-w DIR` |
-| `mvm run -i IMAGE [-u USER] -- CMD` | no | same as build | `-w DIR` only |
+| `mvm run -i IMAGE [-u USER] [-p HOST:CONT] -- CMD` | no (`-p`: inbound on host 127.0.0.1 only) | same as build | `-w DIR` only |
 | `mvm check [--all]` | only api.osv.dev | **only** the lockfiles | nothing (a check record) |
 | `mvm pull IMAGE`, `mvm update` | only image registries | nothing | the image, loaded offline after a clean run |
 | `mvm image build -t localhost/NAME:TAG [-f FILE]` | only OS package mirrors | **only** the Containerfile | the `localhost/` tag, after a clean build |
@@ -32,6 +33,13 @@ The networked steps are `fetch`, `check`, `pull`/`update` and `image build`, eac
 - **No third-party code runs with network.** `go mod download` and `cargo fetch` run none; npm runs with `--ignore-scripts` (run them offline: `mvm build node -- npm rebuild`); Go may not download a newer toolchain (`GOTOOLCHAIN=local`).
 - **Changing dependencies** is a fetch with a command: `mvm fetch go -- go get golang.org/x/net@latest`, `mvm fetch rust -- cargo generate-lockfile`, `mvm fetch node -- npm install --ignore-scripts left-pad`. Only manifest/lockfile changes flow back, and mvm lists them.
 - **Commit-on-clean.** Every writable cache is a reflink copy for the duration of the run and replaces the cache atomically only on exit 0. A failure, Ctrl-C, crash or `kill -9` leaves the cache exactly as it was.
+
+### Inbound-only ports: `mvm run -p`
+
+- `-p HOST:CONT` (repeatable; `127.0.0.1:HOST:CONT` is accepted, any other bind address refused) serves a dev server (nginx, vite, `python -m http.server`) on host `127.0.0.1:HOST`, never the LAN.
+- The microVM runs in a `--network=none` pod: its namespace has only `lo`, so it cannot open a connection to anything, not the internet, DNS, the LAN, the tailnet, or a host service on any of the host's addresses. No pasta, no nftables, no capabilities.
+- Inbound connections cross through Unix sockets: mvm listens on `127.0.0.1:HOST` and splices each connection to a socket that a read-only, no-capability sidecar in the same pod (`mvm/portbridge.py`, stdlib Python, in the pinned observer image: `make observer`) forwards to `127.0.0.1:CONT`. Each side only ever dials its one fixed target, so the workload can answer but never initiate.
+- Proven with a real krun test: HTTP 200 inbound, while connects to 1.1.1.1:443, DNS and a host listener on `0.0.0.0` (via every host address) all fail and the pod lists only `lo`. Only for `run`; the server must listen on `0.0.0.0` or `127.0.0.1` inside the guest.
 
 ### Egress: allowlist proxy, held on denial
 
@@ -152,6 +160,7 @@ Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapi
   - Download or change dependencies: `mvm fetch`, `mvm fetch go -- go get x@v1`
   - Build/test offline: `mvm build -w build -- go build -o build/app ./...`
   - Anything else: `mvm run -i IMAGE -- CMD` (as a non-root user: `mvm run -u 1000:1000 -i IMAGE -- CMD`)
+  - A local dev server, inbound only: `mvm run -p 8080:80 -i IMAGE -- CMD` (host 127.0.0.1:8080, no egress)
   - Images: `mvm pull docker.io/library/alpine:3.24`; build one with `mvm image build -t localhost/NAME:TAG -f Containerfile`
 - Network exists only in `mvm fetch`, `mvm pull` and `mvm image build`, each confined to an allowlist. Do not work around it.
 ```

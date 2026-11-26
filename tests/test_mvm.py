@@ -53,7 +53,7 @@ class _Facade:
 def load_mvm():
     sys.path.insert(0, str(REPO))
     import importlib
-    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "pull", "imagebuild", "cli"]
+    names = ["core", "ecos", "cache", "project", "portbridge", "egress", "observer", "check", "runtime", "pull", "imagebuild", "cli"]
     mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
     # reload in dependency order so cross-module imports see fresh objects
     return _Facade(mods)
@@ -176,6 +176,60 @@ class ProjectTests(Base):
         for bad in (["--net", "--", "x"], ["-i", "img", "--", "x"], ["go"], ["--"]):
             with self.assertRaises(SystemExit):
                 self.mvm.parse_opts(bad, False)
+
+    def test_run_publish_parsing_is_loopback_only(self):
+        opts, _ = self.mvm.parse_opts(["-i", "img", "-p", "8080:80", "--publish", "127.0.0.1:5173:5173", "--", "x"], True)
+        self.assertEqual(opts["ports"], [(8080, 80), (5173, 5173)])
+        for bad in ("0.0.0.0:8080:80", "192.168.1.2:8080:80", "8080", "0:80", "8080:65536", "a:80", "8080:80/udp",
+                    "[::1]:8080:80", "8080:-1", "８０:80", ""):
+            with self.assertRaises(SystemExit, msg=bad):
+                self.mvm.parse_opts(["-i", "img", "-p", bad, "--", "x"], True)
+        with self.assertRaises(SystemExit):           # one host port twice
+            self.mvm.parse_opts(["-i", "i", "-p", "8080:80", "-p", "8080:81", "--", "x"], True)
+        with self.assertRaises(SystemExit):           # build/fetch take no -p
+            self.mvm.parse_opts(["-p", "8080:80", "--", "x"], False)
+
+    def test_run_publish_pod_has_no_network_and_bridge_no_privileges(self):
+        pod = self.mvm.egress.inbound_pod_argv("mvm-ports-R", ["--label", "mvm.run=R"])
+        self.assertEqual(pod[:3], ["podman", "pod", "create"])
+        self.assertIn("--network=none", pod)
+        self.assertFalse([a for a in pod if a == "-p" or "pasta" in a or "publish" in a], pod)   # no podman ports
+        br = self.mvm.egress.bridge_argv("mvm-ports-R", [], "/t/s", "/lib/portbridge.py", "img@sha256:x", [80, 5173])
+        for flag in ("--cap-drop=all", "--read-only", "--pull=never", "no-new-privileges"):
+            self.assertIn(flag, br)
+        self.assertEqual(br[br.index("--pod") + 1], "mvm-ports-R")
+        self.assertFalse([a for a in br if "NET_ADMIN" in a or "--network" in a or "--cap-add" in a])
+        self.assertEqual(br[-4:], ["/portbridge.py", "/sock", "80", "5173"])
+
+    def test_run_publish_joins_the_pod_and_is_refused_elsewhere(self):
+        p = self.mvm.Plan(kind="run", eco=None, image="i", memory="1g", cmd=["x"], src=None, ports=[(8080, 80)])
+        argv = self.mvm.podman_argv(p, "R", {}, Path("/e"), None, "mvm-ports-R")
+        self.assertEqual(argv[argv.index("--pod") + 1], "mvm-ports-R")
+        self.assertFalse([a for a in argv if a.startswith("--network") or a == "-p"], argv)  # network from the pod
+        for kw in ({"kind": "build"}, {"kind": "fetch"}, {"kind": "run", "net": True}):
+            q = self.mvm.Plan(**{"kind": "run", "eco": None, "image": "i", "memory": "1g", "cmd": ["x"],
+                                 "src": None, "ports": [(8080, 80)], **kw})
+            with self.assertRaises(self.mvm.MvmError, msg=kw):
+                self.mvm.podman_argv(q, "R", {}, Path("/e"), ["--network=pasta:x"], "mvm-ports-R")
+        with self.assertRaises(self.mvm.MvmError):    # ports without the pod
+            self.mvm.podman_argv(p, "R", {}, Path("/e"))
+
+    def test_port_bridge_splices_both_ways_with_half_close(self):
+        a, b = socket.socketpair()
+        c, d = socket.socketpair()
+        import threading
+        t = threading.Thread(target=self.mvm.splice, args=(b, c), daemon=True)
+        t.start()
+        a.sendall(b"GET / HTTP/1.0\r\n\r\n")
+        a.shutdown(socket.SHUT_WR)                     # client half-closes; the reply still comes back
+        self.assertEqual(d.recv(100), b"GET / HTTP/1.0\r\n\r\n")
+        self.assertEqual(d.recv(100), b"")
+        d.sendall(b"HTTP/1.0 200 OK\r\n\r\n")
+        d.close()
+        self.assertEqual(a.recv(100), b"HTTP/1.0 200 OK\r\n\r\n")
+        self.assertEqual(a.recv(100), b"")
+        t.join(2)
+        self.assertFalse(t.is_alive())
 
     def test_run_user_goes_to_podman_only_for_run(self):
         opts, _ = self.mvm.parse_opts(["-i", "img", "-u", "1000:1000", "--", "id"], True)
@@ -1430,6 +1484,82 @@ class RealTests(unittest.TestCase):
         r = subprocess.run(["/usr/sbin/debugfs", "-R", f"stat {path}", str(self.cache / f"{name}.img")],
                            capture_output=True, text=True)
         return "Inode:" in r.stdout
+
+    def test_run_publish_inbound_only(self):
+        """Proves: mvm run -p serves HTTP 200 on host 127.0.0.1 from a krun microVM in a
+        --network=none pod, while the guest can open nothing: not 1.1.1.1:443, DNS, a host
+        listener on 0.0.0.0 via any host address, or host loopback; the pod has only lo."""
+        if not self.observer_image():
+            self.skipTest("the Python image is missing (make observer)")
+        import threading
+        import urllib.request
+        sys.path.insert(0, str(REPO))
+        from mvm import observer
+        lst = socket.socket()                                         # host listener on every address
+        lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lst.bind(("0.0.0.0", 0))  # noqa: S104 - the trap: a host listener on every address
+        lst.listen(8)
+        lst.settimeout(0.2)
+        hits = []
+
+        def accept():
+            while not stop.is_set():
+                try:
+                    hits.append(lst.accept()[0])
+                except OSError:
+                    pass
+        stop = threading.Event()
+        threading.Thread(target=accept, daemon=True).start()
+        hp = lst.getsockname()[1]
+        addrs = sorted({ln.split()[3].split("/")[0] for ln in subprocess.run(
+            ["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout.splitlines()})
+        targets = [("1.1.1.1", 443)] + [(a, hp) for a in addrs]   # includes 127.0.0.1, tailnet, bridges
+        port = socket.socket()
+        port.bind(("127.0.0.1", 0))
+        P = port.getsockname()[1]
+        port.close()
+        probe = ("import socket,json\nr={}\n"
+                 f"for h,p in {targets!r}:\n"
+                 "    s=socket.socket(); s.settimeout(3)\n"
+                 "    try: s.connect((h,p)); r[f'{h}:{p}']='OPEN'\n"
+                 "    except OSError as e: r[f'{h}:{p}']=type(e).__name__\n"
+                 "u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.settimeout(3)\n"
+                 "try:\n    u.sendto(bytes(12),('1.1.1.1',53)); u.recv(512); r['dns']='OPEN'\n"
+                 "except OSError as e: r['dns']=type(e).__name__\n"
+                 "print('PROBE'+json.dumps(r), flush=True)\n")
+        (self.proj / "probe.py").write_text(probe)
+        script = "cd /tmp && (python3 -m http.server 8000 >/dev/null 2>&1 &) && python3 /src/probe.py && sleep 25"
+        res = {}
+        th = threading.Thread(target=lambda: res.update(r=self.mvm("run", "-p", f"{P}:8000", "-i",
+                                                                  observer.OBSERVER_IMAGE, "--", "sh", "-c", script)))
+        th.start()
+        status, ifaces = None, ""
+        deadline = time.time() + 40
+        while time.time() < deadline and status is None:
+            time.sleep(1)
+            try:
+                status = urllib.request.urlopen(f"http://127.0.0.1:{P}/", timeout=3).status
+            except OSError:
+                continue
+        bridge = subprocess.run(["podman", "ps", "--format", "{{.Names}}", "--filter", "name=mvm-ports-.*-bridge"],
+                                capture_output=True, text=True).stdout.split()
+        if bridge:
+            ifaces = subprocess.run(["podman", "exec", bridge[0], "python3", "-c",
+                                     "import socket;print(sorted(n for _,n in socket.if_nameindex()))"],
+                                    capture_output=True, text=True).stdout.strip()
+        th.join(90)
+        stop.set()
+        lst.close()
+        r = res["r"]
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(status, 200)
+        self.assertEqual(ifaces, "['lo']")
+        out = json.loads(r.stdout.split("PROBE", 1)[1].splitlines()[0])
+        self.assertFalse({k: v for k, v in out.items() if v == "OPEN"}, out)
+        self.assertEqual(len(out), len(targets) + 1)
+        self.assertEqual(hits, [], "the guest reached the host listener")
+        self.assertFalse(subprocess.run(["podman", "pod", "ps", "-q", "--filter", "name=mvm-ports-"],
+                                        capture_output=True, text=True).stdout.strip())
 
     def test_confined_pull(self):
         """Proves: an image pull goes through the proxy and observer, loads offline by digest,

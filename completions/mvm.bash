@@ -22,9 +22,9 @@ _mvm_completion() {
         build|run)
             case "$prev" in
                 -w) mapfile -t COMPREPLY < <(compgen -d -- "$cur") ;;
-                -i|-u|--user) ;;
+                -i|-u|--user|-p|--publish) ;;
                 *) local w="-w --it --"
-                   [[ "${COMP_WORDS[1]}" == build ]] && w="go rust node $w" || w="-i -u --user $w"
+                   [[ "${COMP_WORDS[1]}" == build ]] && w="go rust node $w" || w="-i -u --user -p --publish $w"
                    mapfile -t COMPREPLY < <(compgen -W "$w" -- "$cur") ;;
             esac ;;
         cache)
