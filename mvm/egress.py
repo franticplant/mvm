@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -71,11 +72,44 @@ echo "MVM_IF=$IF"
 echo MVM_EGRESS_FIREWALL_LOADED
 """
 PROXY_PORT_IN_CONTAINER = 4750
+L7_PORT_IN_CONTAINER = 4751                  # l7proxy (pulls): the VM's entry, chained to Smokescreen
 READY_TIMEOUT = 15.0
 
 
 def firewall_image_present() -> bool:
     return subprocess.run(["podman", "image", "exists", FIREWALL_IMAGE]).returncode == 0
+
+
+def l7proxy_bin() -> Path:
+    return core.LIB_DIR / "l7proxy"
+
+
+def l7_summary(lines: list[str]) -> dict:
+    """l7proxy's JSON log -> {"requests", "denied": [{host, method, path, reason}], "pinned"}."""
+    reqs, denied, pinned = 0, [], []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict) or d.get("msg") != "L7":
+            continue
+        reqs += 1
+        if d.get("allow") is not True:
+            denied.append({k: str(d.get(k, "")) for k in ("host", "method", "path", "reason")})
+        if d.get("pinned"):
+            pinned.append(str(d["pinned"]))
+    return {"requests": reqs, "denied": denied, "pinned": pinned}
+
+
+def merge_l7(summary: dict, lines: list[str]) -> None:
+    """An L7 refusal holds the run like a proxy denial (no [allow] line can fix it)."""
+    l7 = l7_summary(lines)
+    summary["l7"] = l7
+    for d in l7["denied"]:
+        e = summary["denied"].setdefault(d["host"] or "(unknown)", {"connections": 0, "bytes_in": 0, "bytes_out": 0})
+        e["connections"] += 1
+        e["reason"] = f"l7: {d['method']} {d['path']}: {d['reason']}"
 
 
 def smokescreen_bin() -> Path:
@@ -214,8 +248,12 @@ class Proxy:
     container loads the port filter (FIREWALL_SH) into the pod's network namespace,
     then Smokescreen runs in the same pod with no capabilities at all."""
 
-    def __init__(self, run_id: str, hosts: list[str], action: str):
+    def __init__(self, run_id: str, hosts: list[str], action: str, l7: dict | None = None):
         self.run_id = run_id
+        # l7 = {"policy": {...}, "roots": Path}: put l7proxy in front of Smokescreen (pulls)
+        self.l7 = l7
+        self.ca_pem = b""                     # l7: the run's ephemeral CA certificate
+        self._ca_dir: tempfile.TemporaryDirectory | None = None
         self.hosts = hosts
         self.action = action
         self.name = f"mvm-proxy-{run_id}"
@@ -239,6 +277,14 @@ class Proxy:
         (cfg / "acl.yaml").write_text(acl_yaml(self.hosts, self.action))
         (cfg / "config.yaml").write_text(CONFIG_YAML)
         (cfg / "firewall.sh").write_text(FIREWALL_SH)
+        if self.l7 is not None:
+            if not l7proxy_bin().is_file():
+                self._dir.cleanup()
+                raise core.MvmError(f"L7 proxy missing: {l7proxy_bin()} (run `make l7proxy` in the mvm repo)")
+            (cfg / "l7rules.json").write_text(json.dumps(self.l7["policy"]))
+            shutil.copyfile(self.l7["roots"], cfg / "roots.pem")
+            self._ca_dir = tempfile.TemporaryDirectory(prefix="mvm-l7ca-")
+            os.chmod(self._ca_dir.name, 0o700)
         self.port = free_port()
         try:
             self._start(binary, image, cfg)
@@ -250,7 +296,8 @@ class Proxy:
     def _start(self, binary: Path, image: str, cfg: Path) -> None:
         labels = ["--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}"]
         subprocess.run(["podman", "pod", "create", "--name", self.name, *labels,
-                        "-p", f"127.0.0.1:{self.port}:{PROXY_PORT_IN_CONTAINER}"],
+                        "-p", f"127.0.0.1:{self.port}:"
+                        f"{L7_PORT_IN_CONTAINER if self.l7 is not None else PROXY_PORT_IN_CONTAINER}"],
                        check=True, stdout=subprocess.DEVNULL)
         fw = subprocess.run(["podman", "run", "--rm", "--pull=never", "--pod", self.name, *labels,
                              "--cap-drop=all", "--cap-add=NET_ADMIN", "--read-only",
@@ -269,7 +316,29 @@ class Proxy:
                 "--listen-ip", "0.0.0.0",  # noqa: S104
                 "--listen-port", str(PROXY_PORT_IN_CONTAINER)]
         subprocess.run(argv, check=True, stdout=subprocess.DEVNULL)
+        if self.l7 is not None:
+            self._start_l7(cfg)
         self._wait_ready()
+
+    def _start_l7(self, cfg: Path) -> None:
+        labels = ["--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}"]
+        ca_dir = Path(self._ca_dir.name)
+        subprocess.run(["podman", "run", "-d", "--pull=never", "--pod", self.name, "--name", f"{self.name}-l7", *labels,
+                        "--read-only", "--cap-drop=all", "--security-opt", "no-new-privileges",
+                        "-v", f"{l7proxy_bin()}:/l7proxy:ro,z", "-v", f"{cfg}:/cfg:ro,z", "-v", f"{ca_dir}:/ca:z",
+                        core.pinned(PROXY_IMAGE), "/l7proxy", "-listen", f"0.0.0.0:{L7_PORT_IN_CONTAINER}",
+                        "-upstream", f"127.0.0.1:{PROXY_PORT_IN_CONTAINER}", "-rules", "/cfg/l7rules.json",
+                        "-roots", "/cfg/roots.pem", "-ca-out", "/ca/ca.crt"],
+                       check=True, stdout=subprocess.DEVNULL)
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            logs = subprocess.run(["podman", "logs", f"{self.name}-l7"], capture_output=True, text=True)
+            if "L7-READY" in logs.stdout and (ca_dir / "ca.crt").is_file():
+                self.ca_pem = (ca_dir / "ca.crt").read_bytes()
+                if b"BEGIN CERTIFICATE" in self.ca_pem:
+                    return
+            time.sleep(0.1)
+        raise core.MvmError(f"L7 proxy did not start: {(logs.stdout + logs.stderr).strip()[-300:]}")
 
     def _wait_ready(self) -> None:
         deadline = time.monotonic() + READY_TIMEOUT
@@ -283,17 +352,35 @@ class Proxy:
 
     def _stop(self) -> list[str]:
         sm = f"{self.name}-smokescreen"
+        self.l7_lines: list[str] = []
+        l7_ok = True
+        if self.l7 is not None:
+            # Read l7proxy, then stop it first: its idle upstream connections close, so
+            # Smokescreen logs their bytes (CANONICAL-PROXY-CN-CLOSE) before it is read.
+            l7 = f"{self.name}-l7"
+            st7 = subprocess.run(["podman", "container", "inspect", "-f", "{{.State.Running}}", l7],
+                                 capture_output=True, text=True)
+            subprocess.run(["podman", "stop", "-t", "2", l7], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            lg7 = subprocess.run(["podman", "logs", l7], capture_output=True, text=True)
+            l7_ok = st7.stdout.strip() == "true" and lg7.returncode == 0
+            self.l7_lines = lg7.stdout.splitlines()
+            time.sleep(0.3)
         state = subprocess.run(["podman", "container", "inspect", "-f", "{{.State.Running}}", sm],
                                capture_output=True, text=True)
         logs = subprocess.run(["podman", "logs", sm], capture_output=True, text=True)
-        self.healthy = state.stdout.strip() == "true" and logs.returncode == 0
+        self.healthy = state.stdout.strip() == "true" and logs.returncode == 0 and l7_ok
         subprocess.run(["podman", "pod", "rm", "-f", "-t", "2", self.name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if self._dir:
             self._dir.cleanup()
             self._dir = None
+        if self._ca_dir:
+            self._ca_dir.cleanup()
+            self._ca_dir = None
         return (logs.stdout + logs.stderr).splitlines()
 
     def __exit__(self, *exc) -> bool:
         self.summary = summarize(self._stop())
+        if self.l7 is not None:
+            merge_l7(self.summary, self.l7_lines)
         return False

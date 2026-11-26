@@ -25,6 +25,14 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 - **Commit-on-clean.** Every writable cache is a reflink copy for the duration of the run and replaces the cache atomically only on exit 0. A failure, Ctrl-C, crash or `kill -9` leaves the cache exactly as it was.
 - **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed. Every container mvm starts uses `--pull=never`: a pinned image that is missing locally fails the run (re-pin with `mvm pull TAG`); it is never fetched outside the egress.
 - **Confined image pulls.** `mvm pull`, `mvm update` and an image's first use pull through the same proxy and observer as fetch: a static skopeo (`make skopeo`, pure Go, in a `FROM scratch` image) is the microVM's only process and copies the image into a `dir:` layout under `~/.cache/mvm/pulls`. Only after a clean run does the host load it offline (`podman pull dir:...`, which re-checks every blob digest) and pin it by the digest of its platform manifest (`dir:` keeps the registry's manifest bytes; an OCI archive would convert Docker manifests and change the digest). The download is removed whatever happens. A registry outside the allowlist holds the pull (exit 3) with the `[allow] pull = [...]` line to add. The images `make smokescreen`/`observer`/`skopeo` need are the bootstrap and come from plain `podman pull`.
+- **Request-level policy for pulls (L7).** A pull's connections first go to `l7proxy` (`egress/l7proxy`, stdlib Go, `make l7proxy`) in the same proxy pod, chained in front of Smokescreen, so the host allowlist, IP rules, byte counts and the TLS observer all still apply. l7proxy terminates TLS with a leaf from an ephemeral ECDSA P-256 CA made in memory for that run. The private key is never written; the CA is name-constrained to the pull allowlist, and the guest trusts only it, so nothing gets around the proxy. Upstream it uses Go's crypto/tls against the host CA bundle. For each request it checks that:
+  - the method is GET or HEAD;
+  - the SNI, the `Host` header and the CONNECT host are the same;
+  - the path is `/v2/` or `/v2/<this repository>/...` on the registry;
+  - a token is for pulling this repository only (`auth.docker.io/token`, `ghcr.io/token`);
+  - a blob CDN URL is exactly the host and path a registry redirect named.
+
+  Escaped or dot-segment paths are refused. A refusal holds the pull (exit 3). Other registries' token endpoints are hand rules, e.g. `[[l7.pull]] host = "quay.io"`, `exact = ["/v2/auth"]`, `scope = "repository:{repo}:pull"`. Fetch stays pass-through (Smokescreen + observer), so the client's own JA4 and SPLT are what the observer sees.
 - **Confined image builds.** `mvm image build -t localhost/NAME:TAG -f Containerfile` runs `podman --runtime krun build`, so every RUN step (apk/apt and their install scripts) runs in a KVM microVM, on the same confined network as fetch: the per-run proxy (TCP 443 only) and the observer, allowing only OS package mirrors (`dl-cdn.alpinelinux.org`, `deb.debian.org`, `security.debian.org`; more with `[allow] image-build = [...]`; sources on `http://` fail, use the mirrors' https). The build context is an empty directory holding only the Containerfile, so project files and secrets are never in it (COPY of local files fails). Missing base images come through the confined pull first, then `--pull=never --no-cache`. It builds under a temporary tag and gets yours only after a clean run; a held or failed build deletes it (exit 3/4/5). Base images are used by their pinned digest (FROM is rewritten in the build's copy). Refused up front: `ADD` except heredocs (the context is empty, so ADD could only fetch a URL or git repository, which podman does on the host), `RUN --network=...` and `--security=...`, a `# escape=` other than backslash, and `FROM` with build variables. Proxy build args do not end up in the image's environment.
 - **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
 - **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
@@ -65,6 +73,11 @@ go = ["github.com", "codeload.github.com"]
 pull = ["quay.io", "cdn01.quay.io"]   # image registries beyond Docker Hub and GHCR
 image-build = ["archive.archlinux.org"] # OS mirrors for mvm image build (HTTPS only)
 
+[[l7.pull]]            # request rules for pulls from other registries ({repo} = the image's repository)
+host = "quay.io"
+exact = ["/v2/auth"]
+scope = "repository:{repo}:pull"
+
 [observer]             # TLS observer for fetch (needs `make observer`); on by default
 enabled = true
 # log = "/home/me/mvm-flows.jsonl"   # opt-in: append every flow (ETA features) with run metadata
@@ -94,9 +107,11 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 
 ```bash
 sudo dnf install podman crun-krun e2fsprogs
-make setup          # all of: install, smokescreen, observer, skopeo (what a fresh machine needs)
+make setup          # all of: install, smokescreen, observer, skopeo, l7proxy (what a fresh machine needs)
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
+make l7proxy        # build the L7 pull policy proxy offline with mvm (stdlib Go); pulls refuse without it
+make test-go        # its Go unit tests, offline (plain podman: loopback is refused inside krun)
 make skopeo         # build skopeo offline with mvm (static, FROM scratch); image pulls refuse without it
 make observer       # pull the observer's Python image (pinned by digest); on by default, fetch refuses without it
 make ndpi-oracle    # optional, tests only: nDPI 5.0 (last all-LGPLv3 release) to check the observer against

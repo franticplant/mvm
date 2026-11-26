@@ -190,6 +190,20 @@ A registry outside the allowlist holds the pull (exit 3).
 Built\-in registries: Docker Hub and GHCR; others with
 .BR "[allow] pull" .
 .PP
+Pull connections go first to
+.B l7proxy
+.RB ( "make l7proxy" ),
+chained in front of Smokescreen in the same pod. It terminates TLS with an ephemeral,
+name\-constrained CA made in memory per run (the guest trusts only it) and allows only
+GET and HEAD, with SNI, Host and the CONNECT host equal, to
+.I /v2/
+and
+.IR /v2/<repository>/ ...
+on the registry, a token scoped to pulling that repository, and blob URLs exactly as a
+registry redirect named them. A refusal holds the pull (exit 3). Rules for other
+registries:
+.BR "[[l7.pull]]" " host, exact, prefix, scope (" {repo} " is replaced)."
+.PP
 .B mvm image build
 runs
 .BR "podman \-\-runtime krun build" :
@@ -213,6 +227,8 @@ Optional:
 (go, rust, node),
 .B [allow]
 (go, rust, node: lists of extra hosts for fetch; pull: extra registry hosts; image\-build: extra OS mirrors),
+.B [[l7.pull]]
+(request rules for pulls: host, exact, prefix, scope),
 .B [memory]
 (go, rust, node, run),
 .B [observer]

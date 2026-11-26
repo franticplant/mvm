@@ -327,7 +327,7 @@ def cmd_status(args: list[str]) -> int:
     for name in ECOS:
         print(f"  allow {name:<5} {', '.join(egress.allowlist(cfg, name))}")
     why = pull.ready()
-    print(f"pull     {'MISSING: ' + why if why else 'images through the egress proxy (' + pull.SKOPEO_IMAGE + ')'}")
+    print(f"pull     {'MISSING: ' + why if why else 'images through the L7 policy proxy and the egress proxy (' + pull.SKOPEO_IMAGE + ')'}")
     print(f"  allow pull  {', '.join(egress.allowlist(cfg, 'pull'))}")
     print(f"image build  RUN steps in krun, egress through the proxy: {', '.join(egress.allowlist(cfg, 'image-build'))}")
     print(f"check    {'before every fetch' if check.before_fetch(cfg) else 'OFF before fetch'}"

@@ -56,9 +56,38 @@ def ready() -> str:
     """Why a confined pull cannot run, or ''."""
     if subprocess.run(["podman", "image", "exists", SKOPEO_IMAGE]).returncode != 0:
         return f"image pulls need {SKOPEO_IMAGE} (run `make skopeo` in the mvm repo)"
+    if not egress.l7proxy_bin().is_file():
+        return f"image pulls need the L7 proxy {egress.l7proxy_bin()} (run `make l7proxy` in the mvm repo)"
     if ca_bundle() is None:
         return f"image pulls need a host CA bundle (none of {', '.join(map(str, CA_BUNDLES))})"
     return ""
+
+
+# The registry host a pull reference's first component is served from.
+REGISTRY_HOST = {"docker.io": "registry-1.docker.io", "index.docker.io": "registry-1.docker.io"}
+
+
+def l7_policy(ref: str, cfg: dict) -> dict:
+    """Request rules for l7proxy: only this image's repository, read-only.
+
+    The registry gets GET/HEAD on /v2/ and /v2/<repo>/...; its token endpoint only a token
+    scoped to pulling <repo>; blob CDNs only the exact host+path a registry redirect named.
+    Other registries' token endpoints come from [[l7.pull]] rules ("{repo}" is replaced)."""
+    first, _, rest = core.image_repo(ref).partition("/")
+    repo = rest
+    host = REGISTRY_HOST.get(first, first)
+    scope = f"repository:{repo}:pull"
+    rules = [{"host": host, "exact": ["/v2/"], "prefix": [f"/v2/{repo}/"]}]
+    if host == "registry-1.docker.io":
+        rules.append({"host": "auth.docker.io", "exact": ["/token"], "scope": scope})
+    elif host == "ghcr.io":
+        rules.append({"host": "ghcr.io", "exact": ["/token"], "scope": scope})
+    for r in cfg.get("l7", {}).get("pull", []):
+        rules.append({"host": r["host"].lower(),
+                      "exact": [x.replace("{repo}", repo) for x in r.get("exact", [])],
+                      "prefix": [x.replace("{repo}", repo) for x in r.get("prefix", [])],
+                      "scope": r.get("scope", "").replace("{repo}", repo)})
+    return {"rules": rules, "redirects": True, "hosts": egress.allowlist(cfg, "pull")}
 
 
 def copy_argv(ref: str) -> list[str]:
@@ -136,15 +165,17 @@ def confined_pull(ref: str, cfg: dict | None = None) -> str:
         (work / "out" / "tmp").mkdir(parents=True)
         (work / "out" / "img").mkdir()
         (work / "policy.json").write_text(json.dumps(POLICY))
-        # Copied fresh per pull: the host file is labelled cert_t, and relabelling a
-        # system file (:z) is not an option.
-        shutil.copyfile(ca_bundle(), work / "ca.crt")
+        # The guest trusts only this run's ephemeral CA (execute writes it once l7proxy has
+        # made it): every connection goes through l7proxy, nothing can go around it. The
+        # host bundle is l7proxy's, for the real servers.
+        (work / "ca.crt").write_bytes(b"")
         plan = Plan(kind="pull", eco=None, image=SKOPEO_IMAGE, memory="1g", cmd=copy_argv(ref),
                     src=None, net=True, allow=egress.allowlist(cfg, "pull"), observe=observer.enabled(cfg),
                     env={"TMPDIR": "/out/tmp", "HOME": "/out/tmp", "SSL_CERT_FILE": "/etc/mvm/ca.crt"},
                     volumes=[f"{work / 'ca.crt'}:/etc/mvm/ca.crt:ro,z",
                              f"{work / 'policy.json'}:/etc/mvm/policy.json:ro,z", f"{work / 'out'}:/out:z"],
-                    notify=cfg.get("notify", {}).get("ntfy", ""), quiet=True)
+                    notify=cfg.get("notify", {}).get("ntfy", ""), quiet=True,
+                    l7={"policy": l7_policy(ref, cfg), "roots": ca_bundle()}, l7_ca=work / "ca.crt")
         rc = execute(plan)
         if rc != 0:
             denied = sorted(plan.egress_result.get("denied", {}))

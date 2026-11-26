@@ -23,13 +23,14 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: setup install uninstall test test-real lint smokescreen skopeo observer ndpi-oracle timer
+.PHONY: setup install uninstall test test-real test-go lint smokescreen skopeo l7proxy observer ndpi-oracle timer
 
 # Everything a fresh machine needs: mvm, the egress proxy, the observer, confined pulls.
 setup: install
 	$(MAKE) smokescreen
 	$(MAKE) observer
 	$(MAKE) skopeo
+	$(MAKE) l7proxy
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -89,6 +90,20 @@ skopeo:
 		-ldflags '-s -w' -tags '$(SKOPEO_TAGS)' -o out/skopeo ./cmd/skopeo
 	podman build -q -t localhost/mvm-skopeo:1 -f "$(CURDIR)/egress/Containerfile.skopeo" "$(SKOPEO_SRC)/out" >/dev/null
 	@echo "Built localhost/mvm-skopeo:1 (skopeo $(SKOPEO_TAG), static) for confined image pulls"
+
+# The L7 policy proxy for image pulls (stdlib Go, no dependencies), built offline by mvm.
+l7proxy:
+	install -d egress/l7proxy/out
+	cd egress/l7proxy && "$(BINDIR)/mvm" build go -w out -- env CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o out/l7proxy .
+	install -d "$(LIBDIR)"
+	install -m 0755 egress/l7proxy/out/l7proxy "$(LIBDIR)/l7proxy"
+	@echo "Installed l7proxy into $(LIBDIR)"
+
+# Go unit tests for l7proxy, offline; plain podman (crun): loopback sockets in a krun VM are refused.
+test-go:
+	podman run --rm --pull=never --network=none -v "$(CURDIR)/egress/l7proxy:/src:ro,z" -w /src \
+		-e GOCACHE=/tmp/gc -e GOTOOLCHAIN=local docker.io/library/golang:1.27-alpine \
+		sh -c 'test -z "$$(gofmt -l .)" && go vet ./... && go test -count=1 ./...'
 
 observer:
 	podman pull -q "$$(python3 -c 'import sys; sys.path.insert(0, "."); from mvm import observer; print(observer.OBSERVER_IMAGE)')" >/dev/null

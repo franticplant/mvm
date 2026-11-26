@@ -46,7 +46,9 @@ class Plan:
     quiet: bool = False       # the command's own output is shown only when it fails (osv-scanner)
     volumes: list[str] = field(default_factory=list)
     # image build: the podman command from (confined network args, proxy port) instead of a VM run
-    argv_fn: Callable[[list[str], int], list[str]] | None = None    # extra -v specs (pull: CA bundle, output dir)
+    argv_fn: Callable[[list[str], int], list[str]] | None = None
+    l7: dict | None = None              # pulls: l7proxy policy + upstream roots (see egress.Proxy)
+    l7_ca: Path | None = None           # where the run's ephemeral CA certificate goes, for the guest    # extra -v specs (pull: CA bundle, output dir)
 
 
 def new_run_id() -> str:
@@ -220,7 +222,9 @@ def execute(plan: Plan) -> int:
                 net_args = None
                 if plan.net:
                     px = stack.enter_context(
-                        egress.Proxy(run_id, plan.allow, "report" if plan.learn else "enforce"))
+                        egress.Proxy(run_id, plan.allow, "report" if plan.learn else "enforce", plan.l7))
+                    if plan.l7 is not None and plan.l7_ca is not None:
+                        plan.l7_ca.write_bytes(px.ca_pem)      # the guest trusts only this CA
                     plan.env = {**plan.env, **egress.proxy_env(px.port)}
                     net_args = egress.vm_network_args(px.port)
                     if plan.observe:

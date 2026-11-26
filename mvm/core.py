@@ -92,7 +92,7 @@ def load_config() -> dict:
             cfg = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         die(f"{CONFIG_PATH}: {e}")
-    known = ("mask", "images", "memory", "allow", "observer", "check", "notify")
+    known = ("mask", "images", "memory", "allow", "observer", "check", "notify", "l7")
     unknown = set(cfg) - set(known)
     if unknown:
         die(f"{CONFIG_PATH}: unknown keys {sorted(unknown)} (allowed: {', '.join(known)})")
@@ -114,6 +114,15 @@ def load_config() -> dict:
             k in (*ECOS, "pull", "image-build") and isinstance(v, list) and all(valid_allow_host(h) for h in v)
             for k, v in allow.items()):
         die(f"{CONFIG_PATH}: [allow] keys must be {sorted((*ECOS, 'pull', 'image-build'))} with lists of host names")
+    l7 = cfg.get("l7", {})
+    paths_ok = (lambda v: isinstance(v, list) and all(isinstance(x, str) and x.startswith("/") for x in v))
+    if not isinstance(l7, dict) or set(l7) - {"pull"} or not isinstance(l7.get("pull", []), list) or not all(
+            isinstance(r, dict) and not set(r) - {"host", "exact", "prefix", "scope"}
+            and valid_allow_host(r.get("host")) and not str(r.get("host")).startswith("*.")
+            and paths_ok(r.get("exact", [])) and paths_ok(r.get("prefix", []))
+            and isinstance(r.get("scope", ""), str) for r in l7.get("pull", [])):
+        die(f"{CONFIG_PATH}: [[l7.pull]] rules take host = \"name\", exact/prefix = [\"/path\"] "
+            "(\"{repo}\" allowed), scope = \"repository:{repo}:pull\"")
     mask = cfg.get("mask", DEFAULT_MASK)
     if not isinstance(mask, list) or not all(isinstance(m, str) and m for m in mask):
         die(f"{CONFIG_PATH}: mask must be a list of non-empty strings")

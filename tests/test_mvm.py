@@ -324,6 +324,43 @@ class PullTests(Base):
             fedora.mkdir()                      # a directory is not a bundle
             self.assertEqual(self.mvm.pull.ca_bundle(), debian)
 
+    def test_l7_policy_is_scoped_to_the_image(self):
+        pol = self.mvm.pull.l7_policy("docker.io/library/busybox:1.37", {})
+        self.assertEqual(pol["rules"], [
+            {"host": "registry-1.docker.io", "exact": ["/v2/"], "prefix": ["/v2/library/busybox/"]},
+            {"host": "auth.docker.io", "exact": ["/token"], "scope": "repository:library/busybox:pull"}])
+        self.assertTrue(pol["redirects"])
+        self.assertEqual(pol["hosts"], self.mvm.egress.allowlist({}, "pull"))       # the CA's name constraints
+        gh = self.mvm.pull.l7_policy("ghcr.io/astral-sh/ruff@sha256:" + "a" * 64, {})["rules"]
+        self.assertEqual(gh[1], {"host": "ghcr.io", "exact": ["/token"], "scope": "repository:astral-sh/ruff:pull"})
+        self.mvm.CONFIG_PATH.write_text('[allow]\npull = ["quay.io"]\n[[l7.pull]]\nhost = "quay.io"\n'
+                                        'exact = ["/v2/auth"]\nscope = "repository:{repo}:pull"\n')
+        cfg = self.mvm.load_config()
+        q = self.mvm.pull.l7_policy("quay.io/prometheus/busybox:latest", cfg)
+        self.assertEqual(q["rules"], [
+            {"host": "quay.io", "exact": ["/v2/"], "prefix": ["/v2/prometheus/busybox/"]},
+            {"host": "quay.io", "exact": ["/v2/auth"], "prefix": [], "scope": "repository:prometheus/busybox:pull"}])
+        self.assertIn("quay.io", q["hosts"])
+        for bad in ('[[l7.pull]]\nhost = "*.quay.io"\n', '[[l7.pull]]\nhost = "quay.io"\nexact = ["v2"]\n',
+                    '[[l7.pull]]\nhost = "quay.io"\nmethods = ["POST"]\n', '[l7]\nfetch = []\n'):
+            self.mvm.CONFIG_PATH.write_text(bad)
+            with self.assertRaises(SystemExit, msg=bad):
+                self.mvm.load_config()
+
+    def test_l7_denials_hold_the_run(self):
+        lines = ['{"msg":"L7-READY"}', "not json",
+                 '{"msg":"L7","host":"registry-1.docker.io","method":"GET","path":"/v2/","allow":true,"status":401}',
+                 '{"msg":"L7","host":"registry-1.docker.io","method":"POST","path":"/v2/x/","allow":false,'
+                 '"reason":"method POST (GET and HEAD only)"}',
+                 '{"msg":"L7","host":"cdn.example","method":"GET","path":"/b","allow":true,"status":307,"pinned":"cdn.example/c"}']
+        summary = {"allowed": {}, "denied": {}}
+        self.mvm.egress.merge_l7(summary, lines)
+        self.assertEqual((summary["l7"]["requests"], summary["l7"]["pinned"]), (3, ["cdn.example/c"]))
+        self.assertEqual(summary["denied"]["registry-1.docker.io"]["reason"],
+                         "l7: POST /v2/x/: method POST (GET and HEAD only)")
+        # no [allow] line is suggested: the host is already allowed
+        self.assertEqual(self.mvm.allowable(summary, self.mvm.egress.allowlist({}, "pull")), [])
+
     def test_local_images_are_never_pulled(self):
         with self.assertRaises(self.mvm.MvmError):
             self.mvm.pull.confined_pull("localhost/mvm-skopeo:1", {})
@@ -1422,6 +1459,43 @@ class RealTests(unittest.TestCase):
             self.assertEqual(tmp.stdout.strip(), "")
         finally:
             subprocess.run(["podman", "rmi", "-f", tag, "docker.io/library/busybox:1.37"], capture_output=True)
+
+    def test_l7_proxy_enforces_requests(self):
+        """Proves, against the real pod and Docker Hub: l7proxy passes GET /v2/ upstream with
+        real TLS, refuses POST, another repository, a token for another repository and a CDN
+        URL no redirect named, and each refusal is a denial that holds the run."""
+        import ssl
+        import urllib.error
+        import urllib.request
+        sys.path.insert(0, str(REPO))
+        from mvm import egress, pull
+        pol = pull.l7_policy("docker.io/library/busybox:1.37", {})
+        with egress.Proxy("l7test-" + os.urandom(3).hex(), egress.allowlist({}, "pull"), "enforce",
+                          {"policy": pol, "roots": pull.ca_bundle()}) as px:
+            ctx = ssl.create_default_context(cadata=px.ca_pem.decode())        # trusts only the run's CA
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{px.port}"}),
+                urllib.request.HTTPSHandler(context=ctx))
+
+            def status(url, method="GET"):
+                try:
+                    return opener.open(urllib.request.Request(url, method=method), timeout=30).status  # noqa: S310  (https test URLs)
+                except urllib.error.HTTPError as e:
+                    return e.code
+            self.assertEqual(status("https://registry-1.docker.io/v2/"), 401)        # real registry answer
+            self.assertEqual(status("https://registry-1.docker.io/v2/library/busybox/blobs/uploads/", "POST"), 403)
+            self.assertEqual(status("https://registry-1.docker.io/v2/library/alpine/manifests/3.24"), 403)
+            self.assertEqual(status("https://auth.docker.io/token?scope=repository:library/alpine:pull"
+                                    "&service=registry.docker.io"), 403)
+            self.assertEqual(status("https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/"
+                                    "blobs/sha256/00/00/data"), 403)
+        denied = [(d["method"], d["path"]) for d in px.summary["l7"]["denied"]]
+        self.assertEqual(denied, [("POST", "/v2/library/busybox/blobs/uploads/"),
+                                  ("GET", "/v2/library/alpine/manifests/3.24"), ("GET", "/token"),
+                                  ("GET", "/registry-v2/docker/registry/v2/blobs/sha256/00/00/data")])
+        self.assertTrue(px.healthy)
+        self.assertIn("registry-1.docker.io", px.summary["allowed"])
+        self.assertTrue(str(px.summary["denied"]["registry-1.docker.io"]["reason"]).startswith("l7: "))
 
     def test_clean_commit(self):
         """Proves: a run that exits 0 commits its cache writes atomically and records the run."""
