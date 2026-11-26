@@ -73,13 +73,14 @@ fetch refuses to run.
 .PP
 By default (off with
 .BR "[observer] enabled = false" ),
-a passive nDPI (ndpiReader) sidecar in the proxy pod records
-each outbound TLS flow's SNI, JA4 and bytes in the run record. A TLS name
-outside the allowlist, a flow without SNI, or non-TLS traffic on 443 holds the
+mvm's own passive TLS sensor (stdlib Python) runs in the proxy pod and records
+for each outbound connection whether it starts with a TLS ClientHello, its SNI,
+JA4 and bytes in the run record. A TLS name outside the allowlist, a ClientHello
+without SNI, a connection that is not TLS, or conflicting retransmissions hold the
 run (exit 3). The
 observer fails closed: without its image
 .RB ( "make observer" )
-fetch refuses to run; a dead observer, discarded frames, or a proxy connection
+fetch refuses to run; a dead observer, kernel packet drops, or a proxy connection
 without an observed flow commits nothing (exit 5).
 .PP
 Before every fetch,
@@ -189,7 +190,7 @@ The command's exit status; 2 for usage errors; 130 when interrupted;
 3 when a fetch exited 0 but tried a host the proxy denied (the run is held,
 nothing is committed or copied back); 4 when the egress proxy died mid\-run or
 its log could not be read (nothing committed); 5 when the observer was on and
-died mid\-run, its flows could not be read, it discarded frames, or it missed a
+died mid\-run, its flows could not be read, the kernel dropped packets, or it missed a
 connection the proxy made (nothing committed); 6 when a lockfile pins a package
 with an OSV MAL\- advisory (fetch refused or nothing committed;
 .B mvm check

@@ -38,7 +38,7 @@ class Plan:
     learn: bool = False       # fetch --learn: proxy reports instead of enforcing; never commits
     allow: list[str] = field(default_factory=list)      # egress allowlist for net runs
     egress_result: dict = field(default_factory=dict)   # filled by execute(): this run's egress summary
-    observe: bool = False     # net runs: nDPI observer sidecar in the proxy pod (fail closed)
+    observe: bool = False     # net runs: TLS observer sidecar in the proxy pod (fail closed)
     ok_exit: tuple[int, ...] = (0,)   # exit codes that count as clean (osv-scanner: 1 = findings)
     gate: Callable[[], str] | None = None   # runs before commit; a non-empty reason refuses it
     notify: str = ""          # ntfy URL: post when the run trips (held, failed proxy/observer, malicious)
@@ -199,7 +199,7 @@ def execute(plan: Plan) -> int:
                         ob.healthy = False
                         say(f"{label}: the observer has no flow for {missed} connection(s) the proxy made")
                     rec["observer"] = {**ob.summary, "healthy": ob.healthy, "unobserved_connections": missed,
-                                       "discarded_bytes": getattr(ob, "discarded", None)}
+                                       "capture": getattr(ob, "stats", None)}
                     plan.egress_result = {**rec["egress"], "observer": rec["observer"]}
                     say(f"{label}: {observer.summary_line(ob.summary)}")
             observed_ok = not (plan.net and plan.observe) or ob.healthy

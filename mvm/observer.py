@@ -1,35 +1,40 @@
-"""Observer for fetch: a passive nDPI (ndpiReader) sidecar in the egress proxy pod.
+"""Observer for fetch: mvm's own TLS ClientHello sensor (tlsobs.py) in the egress proxy pod.
 
-It captures the pod's outbound leg, where the proxy relays the VM's own TLS
-ClientHello, and reports per flow the SNI, JA4 and bytes. On by default (`[observer] enabled = false`
-in the host config turns it off). It fails closed: a missing
-image refuses the run, and a dead observer or unreadable output means nothing is
-committed. A TLS flow whose SNI is outside the allowlist (or has none) holds the run:
-the proxy only sees the CONNECT host, so this is what catches domain fronting.
+It captures the pod's outbound leg, where the proxy relays the VM's own bytes, and
+reports per connection to port 443 whether it starts with a TLS ClientHello, its SNI
+and JA4, and the bytes each way. On by default (`[observer] enabled = false` in the
+host config turns it off). It fails closed: a missing image refuses the run; a dead
+sensor, unreadable output, kernel drops or too many flows mean nothing is committed
+(exit 5). A connection that is not TLS, has no SNI, an SNI outside the allowlist, or a
+reassembly fault holds the run (exit 3): the proxy only checks the CONNECT host, so this
+is what catches domain fronting and plaintext tunnelled to an allowed host.
 
-Proven with a real proxy pod: pasta gives the pod MTU 65520, and ndpiReader drops
-frames over ~1514 B (the ClientHello among them) unless the firewall one-shot sets
-MTU 1500 first. Then SNI, JA4 and goodput (equal to Smokescreen's byte counts) appear.
+The sensor is stdlib Python in the official Python image (pinned by digest), with
+tlsobs.py mounted read-only: nothing to build, nothing from nDPI. nDPI 5.0 is kept
+only as a black-box oracle for the real tests (`make ndpi-oracle`).
+
+Pod quirk (seen with nDPI, kept): pasta gives the pod MTU 65520; the firewall one-shot
+sets 1500 so captured frames have ordinary sizes.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
-from . import core
+from . import core, tlsobs
 
-# Built by `make observer`: nDPI 5.0 (last all-LGPLv3 release) tarball pinned by sha256, pinned Debian.
-OBSERVER_IMAGE = "localhost/mvm-observer:2"
-READY_MARK = "Capturing live traffic"
+# Official Python image (3.13.18 alpine, 2026-11-05), pulled by `make observer`.
+OBSERVER_IMAGE = ("docker.io/library/python@sha256:"
+                  "d76f585fb0d5107dd47143da5e61554fd9cae656a30f3470f815cb8475769b6a")
+SENSOR = Path(__file__).with_name("tlsobs.py")
+READY_MARK = tlsobs.READY
 READY_TIMEOUT = 15.0
-# ndpiReader prints its traffic statistics on SIGINT; frames it could not parse count here.
-DISCARDED_RE = re.compile(r"Discarded bytes:\s+(\d+)")
 
 
 def enabled(cfg: dict) -> bool:
@@ -40,15 +45,16 @@ def image_present() -> bool:
     return subprocess.run(["podman", "image", "exists", OBSERVER_IMAGE]).returncode == 0
 
 
-def sidecar_argv(pod: str, name: str, run_id: str, iface: str, out: Path) -> list[str]:
-    """ndpiReader parses untrusted packets: raw capture only, nothing else."""
+def sidecar_argv(pod: str, name: str, run_id: str, iface: str, out: Path, pcap: bool = False) -> list[str]:
+    """The sensor parses untrusted packets: raw capture only, nothing else."""
     return ["podman", "run", "-d", "--pod", pod, "--name", name,
             "--label", f"mvm.run={run_id}", "--label", f"mvm.pid={os.getpid()}",
             "--cap-drop=all", "--cap-add=NET_RAW", "--security-opt", "no-new-privileges",
             "--read-only", "--memory", "256m", "--pids-limit", "64",
-            "--stop-signal", "SIGINT",            # ndpiReader writes its flows on SIGINT
-            "-v", f"{out}:/out:z", OBSERVER_IMAGE,
-            "-i", iface, "-k", "/out/flows.json", "-K", "json"]
+            "--stop-signal", "SIGINT",            # the sensor writes its flows on SIGINT
+            "-v", f"{SENSOR}:/obs/tlsobs.py:ro,z", "-v", f"{out}:/out:z", OBSERVER_IMAGE,
+            "python3", "-I", "-B", "/obs/tlsobs.py", iface, "/out/flows.jsonl"] + (
+                ["--pcap", "/out/cap.pcap"] if pcap else [])
 
 
 def _matches(host: str, allow: list[str]) -> bool:
@@ -64,18 +70,14 @@ def _matches(host: str, allow: list[str]) -> bool:
     return False
 
 
-def _is_tls(proto: str) -> bool:
-    """nDPI names TLS flows "TLS" or "TLS.<app>" (e.g. TLS.Google)."""
-    return proto == "TLS" or proto.startswith("TLS.")
-
-
 def summarize(lines: list[str], allow: list[str]) -> dict:
-    """Outbound TLS flows (dst port 443) from ndpiReader's JSON flow lines.
+    """The sensor's flow lines -> summary.
 
     `flows` keeps every flow (never keyed, so nothing is dropped); `outside_allowlist`
-    lists SNIs not covered by the allowlist, with "(no sni)" for a flow without one and
-    "(non-tls:PROTO)" for a flow on 443 that nDPI did not see as TLS (e.g. plaintext HTTP
-    with an allowed Host header sent through CONNECT): only TLS carries a checked SNI.
+    lists SNIs not covered by the allowlist, "(no sni)" for TLS without one, "(non-tls)"
+    for a connection that did not start with a ClientHello (e.g. plaintext HTTP sent
+    through CONNECT to an allowed host), and "(fault: ...)" when reassembly saw
+    conflicting retransmissions: only a cleanly parsed ClientHello carries a checked SNI.
     """
     flows = []
     for line in lines:
@@ -85,16 +87,19 @@ def summarize(lines: list[str], allow: list[str]) -> dict:
             continue
         if not isinstance(d, dict) or d.get("dst_port") != 443:
             continue
-        n = d.get("ndpi") if isinstance(d.get("ndpi"), dict) else {}
-        tls = n.get("tls") if isinstance(n.get("tls"), dict) else {}
-        x = d.get("xfer") if isinstance(d.get("xfer"), dict) else {}
-        flows.append({"sni": n.get("hostname") or "", "ja4": tls.get("ja4", ""), "dst": d.get("dest_ip", ""),
-                      "proto": n.get("proto", ""),
-                      "bytes_out": int(x.get("src2dst_goodput_bytes", 0) or 0),
-                      "bytes_in": int(x.get("dst2src_goodput_bytes", 0) or 0)})
-    outside = sorted({f"(non-tls:{f['proto'] or 'unknown'})" for f in flows if not _is_tls(f["proto"])}
-                     | {f["sni"] or "(no sni)" for f in flows if not f["sni"] or not _matches(f["sni"], allow)})
-    return {"flows": flows, "ja4": sorted({f["ja4"] for f in flows if f["ja4"]}), "outside_allowlist": outside}
+        flows.append({"sni": str(d.get("sni") or ""), "ja4": str(d.get("ja4") or ""), "dst": str(d.get("dst", "")),
+                      "proto": str(d.get("proto", "")), "why": str(d.get("why") or ""),
+                      "fault": str(d.get("fault") or ""),
+                      "bytes_out": int(d.get("bytes_out", 0) or 0), "bytes_in": int(d.get("bytes_in", 0) or 0)})
+    outside = set()
+    for f in flows:
+        if f["fault"]:
+            outside.add(f"(fault: {f['fault']})")
+        if f["proto"] != "TLS":
+            outside.add("(non-tls)")
+        elif not f["sni"] or not _matches(f["sni"], allow):
+            outside.add(f["sni"] or "(no sni)")
+    return {"flows": flows, "ja4": sorted({f["ja4"] for f in flows if f["ja4"]}), "outside_allowlist": sorted(outside)}
 
 
 def unobserved(s: dict, proxy_summary: dict) -> int:
@@ -114,7 +119,7 @@ def summary_line(s: dict) -> str:
 
 
 class Observer:
-    """ndpiReader in the proxy pod, started before the VM and stopped after it."""
+    """The TLS sensor in the proxy pod, started before the VM and stopped after it."""
 
     def __init__(self, run_id: str, pod: str, iface: str, allow: list[str]):
         self.run_id = run_id
@@ -124,8 +129,9 @@ class Observer:
         self.name = f"{pod}-observer"
         self._dir: tempfile.TemporaryDirectory | None = None
         self.summary: dict = {"flows": [], "ja4": [], "outside_allowlist": []}
-        self.healthy = False                  # ran the whole time, flow file read, nothing discarded
-        self.discarded = -1                   # ndpiReader's "Discarded bytes" (-1: no stats line)
+        self.healthy = False                  # ran the whole time, flow file read, nothing dropped
+        self.stats: dict | None = None        # the sensor's STATS line (packets, drops, overflow)
+        self.keep = os.environ.get("MVM_OBSERVER_PCAP", "")   # tests: keep pcap + flows here (nDPI oracle)
 
     def __enter__(self) -> Observer:
         if not image_present():
@@ -137,7 +143,7 @@ class Observer:
         out = Path(self._dir.name)
         os.chmod(out, 0o700)
         try:
-            subprocess.run(sidecar_argv(self.pod, self.name, self.run_id, self.iface, out),
+            subprocess.run(sidecar_argv(self.pod, self.name, self.run_id, self.iface, out, bool(self.keep)),
                            check=True, stdout=subprocess.DEVNULL)
             self._wait_ready()
         except BaseException:
@@ -172,16 +178,23 @@ class Observer:
         lines = None
         if self._dir:
             try:
-                lines = (Path(self._dir.name) / "flows.json").read_text().splitlines()
+                lines = (Path(self._dir.name) / "flows.jsonl").read_text().splitlines()
             except OSError:
                 lines = None
-        # Fail closed on capture loss too: no discarded frames. ndpiReader prints no stats at all
-        # after zero packets (seen in a real quiet fetch), so a missing stats line is accepted
-        # only with an empty flow file; connections the proxy made then fail via unobserved().
-        m = DISCARDED_RE.search(self._logs())
-        self.discarded = int(m.group(1)) if m else -1
-        quiet = lines is not None and not any(ln.strip() for ln in lines)
-        stats_ok = self.discarded == 0 or (self.discarded == -1 and quiet)
+            if self.keep:
+                for n in ("flows.jsonl", "cap.pcap"):
+                    if (Path(self._dir.name) / n).is_file():
+                        shutil.copy(Path(self._dir.name) / n, Path(self.keep) / f"{self.run_id}-{n}")
+        self.stats = None
+        for ln in self._logs().splitlines():
+            if ln.startswith(tlsobs.STATS):
+                try:
+                    self.stats = json.loads(ln[len(tlsobs.STATS):])
+                except ValueError:
+                    self.stats = None
+        st = self.stats if isinstance(self.stats, dict) else {}
+        # Fail closed on capture loss: the kernel dropped nothing and no flow was turned away.
+        stats_ok = st.get("drops") == 0 and st.get("overflow") == 0
         self.healthy = alive and code == "0" and lines is not None and stats_ok
         return lines
 

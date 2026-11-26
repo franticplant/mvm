@@ -7,9 +7,12 @@ and run only with MVM_REAL=1; each takes a few seconds.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -404,36 +407,164 @@ class EgressTests(Base):
         self.assertIn("outside the allowlist (learn mode): storage.googleapis.com", line)
 
 
+class TlsSensorTests(Base):
+    """mvm/tlsobs.py: ClientHello parsing, JA4 and TCP reassembly (clean-room; the real
+    ClientHellos below were captured by the sensor, JA4 checked against nDPI 5.0)."""
+    HELLOS = json.loads((Path(__file__).parent / "data" / "clienthellos.json").read_text())
+
+    @staticmethod
+    def hello(ciphers=(0x1301, 0x1302), exts=None, legacy=0x0303) -> bytes:
+        """A ClientHello in one handshake record. exts: list of (type, data)."""
+        body = struct.pack(">H", legacy) + b"\0" * 32 + b"\0" + struct.pack(">H", 2 * len(ciphers))
+        body += b"".join(struct.pack(">H", c) for c in ciphers) + b"\x01\x00"
+        if exts is not None:
+            e = b"".join(struct.pack(">HH", t, len(d)) + d for t, d in exts)
+            body += struct.pack(">H", len(e)) + e
+        hs = b"\x01" + len(body).to_bytes(3, "big") + body
+        return b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs
+
+    @staticmethod
+    def sni(name: bytes) -> tuple:
+        entry = b"\x00" + struct.pack(">H", len(name)) + name
+        return (0x0000, struct.pack(">H", len(entry)) + entry)
+
+    @staticmethod
+    def alpn(*protos: bytes) -> tuple:
+        lst = b"".join(bytes([len(p)]) + p for p in protos)
+        return (0x0010, struct.pack(">H", len(lst)) + lst)
+
+    def test_real_client_hellos_match_ndpi(self):
+        t = self.mvm.tlsobs
+        for h in self.HELLOS:
+            r = t.classify(bytes.fromhex(h["stream_hex"]))
+            self.assertEqual((r["proto"], r["sni"], r["ja4"]), ("TLS", h["sni"], h["ja4_ndpi_5_0"]), h["client"])
+
+    def test_reassembly_in_any_segmentation_and_order(self):
+        t = self.mvm.tlsobs
+        stream = bytes.fromhex(self.HELLOS[0]["stream_hex"])
+        want = t.classify(stream)
+        for size in (1, 7, 536, 1448):
+            segs = [(o, stream[o:o + size]) for o in range(0, len(stream), size)]
+            for order in (segs, segs[::-1], segs[1::2] + segs[::2]):
+                f = t.Flow("1.2.3.4", 1000)
+                for o, d in order:
+                    f.client_data(1001 + o, d)
+                f.client_data(1001, stream[:5])                  # a harmless retransmission
+                self.assertEqual((f.result, f.fault), (want, ""), (size, len(order)))
+        f = t.Flow("1.2.3.4", 1000)                               # a conflicting retransmission
+        f.client_data(1001 + 10, stream[10:20])
+        f.client_data(1001 + 10, b"X" * 10)
+        self.assertEqual(f.fault, "conflicting retransmission")
+        f = t.Flow("1.2.3.4", 0xfffffff0)                         # sequence numbers wrap
+        for o in range(0, len(stream), 100):
+            f.client_data((0xfffffff1 + o) & 0xffffffff, stream[o:o + 100])
+        self.assertEqual(f.result, want)
+
+    def test_hello_split_across_records(self):
+        t = self.mvm.tlsobs
+        stream = bytes.fromhex(self.HELLOS[1]["stream_hex"])
+        hs = t.handshake_bytes(stream)
+        full = b"\x01" + len(hs).to_bytes(3, "big") + hs
+        split = b"".join(b"\x16\x03\x03" + struct.pack(">H", len(full[i:i + 300])) + full[i:i + 300]
+                         for i in range(0, len(full), 300))
+        self.assertEqual(t.classify(split), t.classify(stream))
+
+    def test_ja4_rules(self):
+        t = self.mvm.tlsobs
+        grease = 0x3a3a
+        versions = (0x002b, bytes([6]) + struct.pack(">HHH", grease, 0x0304, 0x0303))
+        sig = (0x000d, struct.pack(">HHHH", 6, 0x0804, grease, 0x0403))
+        r = t.classify(self.hello(ciphers=(grease, 0x1302, 0x1301),
+                                  exts=[(grease, b""), self.sni(b"a.org"), self.alpn(b"h2", b"http/1.1"),
+                                        versions, sig, (0x000a, b"\0\0")]))
+        a, b, c = r["ja4"].split("_")
+        self.assertEqual(a, "t13d0205h2")                          # GREASE never counted; version from 0x002b
+        self.assertEqual(b, hashlib.sha256(b"1301,1302").hexdigest()[:12])       # sorted
+        self.assertEqual(c, hashlib.sha256(b"000a,000d,002b_0804,0403").hexdigest()[:12])  # no SNI/ALPN; sigalgs in wire order
+        self.assertEqual(r["sni"], "a.org")
+        r = t.classify(self.hello(exts=[self.alpn(b"\xab\xcd")]))
+        self.assertTrue(r["ja4"].startswith("t12i0201ad_"))       # no SNI: i; non-alnum ALPN: hex first/last
+        r = t.classify(self.hello(exts=None, legacy=0x0301))
+        self.assertTrue(r["ja4"].startswith("t10i020000_") and r["ja4"].endswith("_000000000000"))
+        self.assertEqual(r["sni"], "")
+
+    def test_non_tls_and_malformed(self):
+        t = self.mvm.tlsobs
+        self.assertEqual(t.classify(b"GET / HTTP/1.0\r\nHost: proxy.golang.org\r\n\r\n")["proto"], "non-TLS")
+        self.assertEqual(t.classify(b"\x14\x03\x03\x00\x01\x01")["proto"], "non-TLS")      # not a handshake
+        self.assertEqual(t.classify(b"\x16\x03\x03\x00\x05\x02\x00\x00\x01\x00")["proto"], "non-TLS")  # ServerHello
+        self.assertIsNone(t.classify(self.hello()[:30]))                                     # a prefix: need more
+        broken = bytearray(self.hello(exts=[self.sni(b"a.org")]))
+        broken[-7] = 0xff                                         # the host name's length now overruns
+        self.assertEqual(t.classify(bytes(broken))["proto"], "non-TLS")
+        f = t.Flow("1.2.3.4", 1)
+        f.client_data(2, self.hello()[:30])
+        f.closed = True
+        self.assertEqual(f.record()["why"], "connection ended before a ClientHello")
+        f = t.Flow("1.2.3.4", 1)                                  # never completes: capped, not buffered forever
+        f.client_data(2, b"\x16\x03\x03\x40\x00" + b"\x01\x00\x40\x00" + b"\0" * (t.HELLO_CAP + 100))
+        self.assertEqual(f.result["proto"], "non-TLS")
+
+    @staticmethod
+    def ip4(src, dst, sport, dport, seq, flags, payload=b""):
+        tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 0, 5 << 4, flags, 65535, 0, 0) + payload
+        hdr = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 0, 0x4000, 64, 6, 0,
+                          socket.inet_aton(src), socket.inet_aton(dst))
+        return hdr + tcp
+
+    def test_tracker(self):
+        t = self.mvm.tlsobs
+        tr = t.Tracker()
+        stream = bytes.fromhex(self.HELLOS[0]["stream_hex"])
+        c, s = ("10.0.0.2", 40000), ("104.16.9.34", 443)
+        tr.packet(self.ip4(*c[:1], *s[:1], c[1], 443, 100, 0x02), True)            # SYN
+        tr.packet(self.ip4(s[0], c[0], 443, c[1], 9000, 0x12), False)              # SYN-ACK
+        tr.packet(self.ip4(c[0], s[0], c[1], 443, 101, 0x18, stream), True)
+        tr.packet(self.ip4(s[0], c[0], 443, c[1], 9001, 0x18, b"x" * 500)[:60], False)   # truncated inbound
+        tr.packet(self.ip4(c[0], s[0], c[1], 443, 101 + len(stream), 0x11), True)  # FIN
+        tr.packet(self.ip4(c[0], s[0], 40001, 443, 7, 0x02), True)                  # never answered: not a flow
+        tr.packet(self.ip4(c[0], s[0], c[1], 443, 5000, 0x02), True)                # the port reused
+        tr.packet(self.ip4(s[0], c[0], 443, c[1], 1, 0x12), False)
+        tr.packet(self.ip4(c[0], s[0], c[1], 443, 5001, 0x18, b"GET /"), True)
+        tr.packet(self.ip4(c[0], s[0], 40002, 80, 1, 0x02), True)                   # not port 443
+        r = tr.records()
+        self.assertEqual([(x["proto"], x["sni"]) for x in r], [("TLS", "registry.npmjs.org"), ("non-TLS", "")])
+        self.assertEqual((r[0]["bytes_out"], r[0]["bytes_in"]), (len(stream), 500))
+        tr = t.Tracker()
+        for i in range(t.MAX_FLOWS + 3):
+            tr.packet(self.ip4("10.0.0.2", "1.1.1.1", 1024 + i, 443, 1, 0x02), True)
+        self.assertEqual(tr.overflow, 3)
+
+
 class ObserverTests(Base):
-    # One flow line as real ndpiReader 6.0 wrote it in a proxy pod (trimmed), registry.npmjs.org via curl.
-    REAL = ('{"src_ip":"10.5.29.71","dest_ip":"104.16.3.34","src_port":55322,"dst_port":443,"ip":4,'
-            '"ndpi":{"proto":"TLS","hostname":"registry.npmjs.org","tls":{"version":"TLSv1.2",'
-            '"ja4":"t13d3513h2_bfa337485184_8d7351bd871b"}},'
-            '"xfer":{"src2dst_goodput_bytes":1949,"dst2src_goodput_bytes":26332}}')
-    DNS = '{"dest_ip":"169.254.1.1","dst_port":53,"ndpi":{"proto":"DNS","hostname":"registry.npmjs.org"}}'
+    # One flow line as the sensor writes it (real values: registry.npmjs.org via wget).
+    REAL = ('{"dst": "104.16.9.34", "dst_port": 443, "proto": "TLS", "sni": "registry.npmjs.org", '
+            '"ja4": "t13d301100_1d37bd780c83_8e6e362c5eac", "why": "", "fault": "", '
+            '"bytes_out": 1759, "bytes_in": 26661}')
+    DNS = '{"dst": "169.254.1.1", "dst_port": 53, "proto": "DNS", "sni": "registry.npmjs.org"}'
 
     def test_summarize_real_flow(self):
-        s = self.mvm.observer.summarize([self.REAL, self.DNS, "Welcome to nDPI", "[]"], ["registry.npmjs.org"])
-        self.assertEqual(s["flows"], [{"sni": "registry.npmjs.org", "ja4": "t13d3513h2_bfa337485184_8d7351bd871b",
-                                       "dst": "104.16.3.34", "proto": "TLS", "bytes_out": 1949, "bytes_in": 26332}])
+        s = self.mvm.observer.summarize([self.REAL, self.DNS, "garbage", "[]"], ["registry.npmjs.org"])
+        self.assertEqual(s["flows"], [{"sni": "registry.npmjs.org", "ja4": "t13d301100_1d37bd780c83_8e6e362c5eac",
+                                       "dst": "104.16.9.34", "proto": "TLS", "why": "", "fault": "",
+                                       "bytes_out": 1759, "bytes_in": 26661}])
         self.assertEqual(s["outside_allowlist"], [])
-        self.assertIn("JA4 t13d3513h2", self.mvm.observer.summary_line(s))
+        self.assertIn("JA4 t13d301100", self.mvm.observer.summary_line(s))
 
-    def test_plaintext_on_443_is_held(self):
-        """Plaintext HTTP with an allowed Host header sent through CONNECT :443 has no TLS,
-        so no SNI was checked: nDPI reports proto HTTP with the Host as hostname."""
-        http = ('{"dest_ip":"142.250.1.1","dst_port":443,"ndpi":{"proto":"HTTP",'
-                '"hostname":"proxy.golang.org"},"xfer":{}}')
-        s = self.mvm.observer.summarize([http], ["proxy.golang.org"])
-        self.assertEqual(s["outside_allowlist"], ["(non-tls:HTTP)"])
-        app = self.REAL.replace('"proto":"TLS"', '"proto":"TLS.Cloudflare"')
-        unknown = self.REAL.replace('"proto":"TLS",', "")
-        s = self.mvm.observer.summarize([app, unknown, self.REAL], ["registry.npmjs.org"])
-        self.assertEqual(s["outside_allowlist"], ["(non-tls:unknown)"])   # TLS.<app> is TLS
+    def test_plaintext_and_faults_are_held(self):
+        """Plaintext HTTP with an allowed Host header sent through CONNECT :443 never had its
+        name checked; a reassembly fault means the bytes seen may not be what the server got."""
+        http = ('{"dst": "142.250.1.1", "dst_port": 443, "proto": "non-TLS", "sni": "", "ja4": "", '
+                '"why": "first byte 0x47 is not a TLS handshake record"}')
+        s = self.mvm.observer.summarize([http, self.REAL], ["proxy.golang.org", "registry.npmjs.org"])
+        self.assertEqual(s["outside_allowlist"], ["(non-tls)"])
+        fault = self.REAL.replace('"fault": ""', '"fault": "conflicting retransmission"')
+        s = self.mvm.observer.summarize([fault], ["registry.npmjs.org"])
+        self.assertEqual(s["outside_allowlist"], ["(fault: conflicting retransmission)"])
 
     def test_sni_outside_allowlist_and_missing_sni(self):
         fronted = self.REAL.replace("registry.npmjs.org", "evil.example")
-        no_sni = self.REAL.replace('"hostname":"registry.npmjs.org",', "")
+        no_sni = self.REAL.replace('"sni": "registry.npmjs.org"', '"sni": ""')
         sub = self.REAL.replace("registry.npmjs.org", "Codeload.GitHub.com.")
         s = self.mvm.observer.summarize([fronted, no_sni, sub, self.REAL], ["registry.npmjs.org", "*.github.com"])
         self.assertEqual(len(s["flows"]), 4)
@@ -446,15 +577,20 @@ class ObserverTests(Base):
         for bad in (".github.com", "a..github.com", "github.com", "evilgithub.com", ""):
             self.assertFalse(m(bad, ["*.github.com"]), bad)
 
-    def test_stop_health_needs_clean_exit_flows_and_zero_discarded(self):
-        cases = [("Discarded bytes:       0\n", "0", True, self.REAL), ("Discarded bytes:       23222\n", "0", False, self.REAL),
-                 ("", "0", False, self.REAL),          # flows but no stats line: not trusted
-                 ("", "0", True, ""),                  # zero packets: ndpiReader prints no stats
-                 ("Discarded bytes: 0\n", "137", False, self.REAL)]
+    def test_stop_health_needs_clean_exit_flows_and_zero_drops(self):
+        st = self.mvm.tlsobs.STATS
+        ok = st + '{"packets": 9, "drops": 0, "overflow": 0, "faults": 0}\n'
+        cases = [(ok, "0", True, self.REAL), (ok, "0", True, ""),              # quiet fetch: still a stats line
+                 (ok.replace('"drops": 0', '"drops": 3'), "0", False, self.REAL),
+                 (ok.replace('"overflow": 0', '"overflow": 1'), "0", False, self.REAL),
+                 ("", "0", False, ""),                                          # no stats line: not trusted
+                 (st + "{not json\n", "0", False, self.REAL),
+                 (ok, "137", False, self.REAL)]
         for logs, code, healthy, flows in cases:
             ob = self.mvm.observer.Observer("RID", "pod", "eth0", ["a.org"])
+            ob.keep = ""
             ob._dir = tempfile.TemporaryDirectory()
-            (Path(ob._dir.name) / "flows.json").write_text(flows + "\n")
+            (Path(ob._dir.name) / "flows.jsonl").write_text(flows + "\n")
             ret = subprocess.CompletedProcess([], 0, code + "\n", "")
             with mock.patch.object(ob, "_running", return_value=True), \
                     mock.patch.object(ob, "_logs", return_value=logs), \
@@ -470,7 +606,12 @@ class ObserverTests(Base):
                      "--pids-limit", "--memory", "mvm.run=RID", "SIGINT"):
             self.assertIn(flag, argv)
         self.assertNotIn("--cap-add=NET_ADMIN", argv)
-        self.assertEqual([a for a in argv if a.startswith("-v") or ":/" in a], ["-v", "/o:/out:z"])
+        sensor = str(self.mvm.observer.SENSOR)
+        self.assertEqual([a for a in argv if a.startswith("-v") or ":/" in a],
+                         ["-v", f"{sensor}:/obs/tlsobs.py:ro,z", "-v", "/o:/out:z"])   # the sensor read-only
+        self.assertEqual(argv[argv.index(self.mvm.observer.OBSERVER_IMAGE) + 1:],
+                         ["python3", "-I", "-B", "/obs/tlsobs.py", "eth0", "/out/flows.jsonl"])
+        self.assertIn("@sha256:", self.mvm.observer.OBSERVER_IMAGE)
 
 
 class CheckTests(Base):
@@ -927,6 +1068,12 @@ class RealTests(unittest.TestCase):
         subprocess.run([sys.executable, str(SCRIPT), "cache", "gc"], env=self.env, capture_output=True)
         self.tmp.cleanup()
 
+    @staticmethod
+    def observer_image() -> bool:
+        sys.path.insert(0, str(REPO))
+        from mvm import observer
+        return observer.image_present()
+
     def mvm(self, *args, **kw):
         return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=self.proj, env=self.env,
                               capture_output=True, text=True, timeout=120, **kw)
@@ -1034,12 +1181,12 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         """Proves: with the observer on, a TLS ClientHello whose SNI is outside the allowlist,
         sent through a CONNECT the proxy allowed, holds the run (exit 3, nothing committed).
         Negative control in the same run: the honest SNI is observed and not flagged.
-        Needs smokescreen, localhost/mvm-observer:2 (make observer) and internet."""
+        Needs smokescreen, the observer image (make observer) and internet."""
         lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
         if not (lib / "smokescreen").is_file():
             self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:2 (make observer)")
+        if not self.observer_image():
+            self.skipTest("no observer image (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
@@ -1054,18 +1201,81 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         self.assertEqual(rec["result"], "held")
         self.assertEqual(rec["egress"]["denied"], {})                    # the proxy saw nothing wrong
         self.assertTrue(rec["observer"]["healthy"])
-        self.assertEqual(rec["observer"]["discarded_bytes"], 0)
+        self.assertEqual(rec["observer"]["capture"]["drops"], 0)
         self.assertEqual(rec["observer"]["unobserved_connections"], 0)
         self.assertEqual(rec["observer"]["outside_allowlist"], ["example.com"])
         self.assertEqual(sorted({f["sni"] for f in rec["observer"]["flows"]}), ["example.com", "proxy.golang.org"])
         self.assertTrue(all(f["ja4"] for f in rec["observer"]["flows"]))
         self.assertIn("SNI OUTSIDE THE ALLOWLIST: example.com", r.stderr)
 
+    def test_sensor_matches_ndpi_on_real_fetches(self):
+        """Proves: on real go, rust and node fetches (registry clients' own ClientHellos,
+        Go's with a post-quantum key share spanning TCP segments), mvm's sensor reports the
+        same SNI and JA4 per connection as nDPI 5.0 reading the very same packets.
+        Needs smokescreen, the observer image, `make ndpi-oracle` and internet."""
+        lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
+        if not (lib / "smokescreen").is_file():
+            self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
+        oracle = "localhost/mvm-ndpi-oracle:5.0"
+        if subprocess.run(["podman", "image", "exists", oracle]).returncode != 0:
+            self.skipTest(f"no {oracle} (make ndpi-oracle)")
+        if not self.observer_image():
+            self.skipTest("no observer image (make observer)")
+        keep = Path(self.tmp.name) / "keep"
+        keep.mkdir()
+        self.env["MVM_OBSERVER_PCAP"] = str(keep)
+        (self.proj / "go.mod").write_text("module example.com/x\n\ngo 1.27\n\nrequire rsc.io/quote v1.5.2\n")
+        r = self.mvm("fetch", "go")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.proj / "go.mod").unlink()
+        (self.proj / "Cargo.toml").write_text('[package]\nname = "x"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                                              '[dependencies]\nitoa = "1"\n')
+        (self.proj / "src").mkdir()
+        (self.proj / "src" / "main.rs").write_text("fn main() {}\n")
+        r = self.mvm("fetch", "rust")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for f in ("Cargo.toml", "Cargo.lock"):
+            (self.proj / f).unlink(missing_ok=True)
+        (self.proj / "package.json").write_text('{"name":"p","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}')
+        (self.proj / "package-lock.json").write_text(json.dumps(
+            {"name": "p", "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": {
+                "": {"name": "p", "version": "1.0.0", "dependencies": {"left-pad": "1.3.0"}},
+                "node_modules/left-pad": {"version": "1.3.0", "resolved":
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz", "integrity":
+                    "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="}}}))
+        r = self.mvm("fetch", "node")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        compared = set()
+        for pcap in sorted(keep.glob("*-cap.pcap")):
+            ours = sorted((d["sni"], d["ja4"]) for d in map(json.loads, Path(str(pcap).replace("-cap.pcap", "-flows.jsonl"))
+                                                                .read_text().splitlines()) if d["proto"] == "TLS")
+            out = Path(self.tmp.name) / "oracle"
+            out.mkdir(exist_ok=True)
+            subprocess.run(["podman", "run", "--rm", "--network=none", "--cap-drop=all",
+                            "-v", f"{keep}:/in:ro,z", "-v", f"{out}:/out:z", oracle,
+                            "-i", f"/in/{pcap.name}", "-k", "/out/n.json", "-K", "json"],
+                           capture_output=True, check=True)
+            theirs = []
+            for line in (out / "n.json").read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                n = d.get("ndpi", {}) if isinstance(d, dict) else {}
+                if isinstance(d, dict) and d.get("dst_port") == 443 and str(n.get("proto", "")).startswith("TLS"):
+                    theirs.append((n.get("hostname", ""), (n.get("tls") or {}).get("ja4", "")))
+            self.assertEqual(ours, sorted(theirs), pcap.name)
+            self.assertTrue(all(sni and ja4 for sni, ja4 in ours))
+            compared |= set(ours)
+        snis = {s for s, _ in compared}
+        for host in ("proxy.golang.org", "index.crates.io", "registry.npmjs.org", "api.osv.dev"):
+            self.assertIn(host, snis)
+
     def test_observer_quiet_fetch_commits(self):
         """Proves: with the observer on, a fetch that makes no connection still commits
-        (ndpiReader writes a flow file and a clean stats line even with no traffic)."""
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:2 (make observer)")
+        (the sensor writes an empty flow file and a clean stats line with no traffic)."""
+        if not self.observer_image():
+            self.skipTest("no observer image (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
@@ -1074,7 +1284,7 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
         self.assertEqual(rec["observer"]["flows"], [])
         self.assertTrue(rec["observer"]["healthy"])
-        self.assertEqual(rec["observer"]["discarded_bytes"], -1)     # no packets, no stats line
+        self.assertEqual((rec["observer"]["capture"]["drops"], rec["observer"]["flows"]), (0, []))
 
     PLAIN_GO = r"""package main
 
@@ -1104,14 +1314,14 @@ func main() { tunnel(false); tunnel(true) }
 """
 
     def test_observer_holds_plaintext_on_443(self):
-        """Proves: plaintext HTTP sent through a CONNECT to an allowed host:443 (nDPI sees
+        """Proves: plaintext HTTP sent through a CONNECT to an allowed host:443 (the sensor sees
         proto HTTP with that Host, no TLS, so no SNI was checked) holds the run (exit 3).
         Control in the same run: real TLS to the same host is observed and not flagged."""
         lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
         if not (lib / "smokescreen").is_file():
             self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:2 (make observer)")
+        if not self.observer_image():
+            self.skipTest("no observer image (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
@@ -1126,8 +1336,8 @@ func main() { tunnel(false); tunnel(true) }
         self.assertEqual(rec["result"], "held")
         self.assertEqual(rec["egress"]["denied"], {})                    # the proxy saw nothing wrong
         self.assertTrue(rec["observer"]["healthy"])
-        self.assertEqual(rec["observer"]["outside_allowlist"], ["(non-tls:HTTP)"])
-        self.assertEqual(sorted(f["proto"] for f in rec["observer"]["flows"]), ["HTTP", "TLS"])
+        self.assertEqual(rec["observer"]["outside_allowlist"], ["(non-tls)"])
+        self.assertEqual(sorted(f["proto"] for f in rec["observer"]["flows"]), ["TLS", "non-TLS"])
 
     def test_fresh_npm_repo_fetches(self):
         """Proves: a fresh `npm init` repo (lockfile with 0 packages; osv-scanner exits 128)

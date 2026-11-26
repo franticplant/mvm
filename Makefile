@@ -5,9 +5,8 @@ LIBDIR ?= $(PREFIX)/lib/mvm
 # at least two weeks old; built offline by mvm itself from its vendored sources.
 SMOKESCREEN_REV ?= 5b4b7aabca9bc70a8435358d648edd03294c299e
 SMOKESCREEN_SRC ?= $(HOME)/.cache/mvm-src/smokescreen
-# nDPI (ntop) for the observer (on by default; fetch refuses without its image): release tarball pinned by sha256.
-# Pinned to 5.0, the last release wholly under LGPLv3: from 6.0 the TLS, QUIC, DNS and DHCP
-# dissectors are ntop dual-licensed (free only for not-for-profit use). Never take 6.x code.
+# nDPI 5.0 (ntop), the last all-LGPLv3 release, only as a black-box oracle for the observer's
+# real tests (`make ndpi-oracle`): from 6.0 its TLS dissector is ntop dual-licensed. Never take 6.x code.
 NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/5.0.tar.gz
 NDPI_SHA256 ?= 8b0d3dc0c8a6a68578e09a18c922021ef6458d4aca1c7a20ce04efc267aa9ea5
 NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
@@ -16,7 +15,7 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test test-real lint smokescreen observer timer
+.PHONY: install uninstall test test-real lint smokescreen observer ndpi-oracle timer
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -64,11 +63,15 @@ smokescreen:
 	@echo "Installed smokescreen $(SMOKESCREEN_REV) into $(LIBDIR) and built localhost/mvm-egress-fw:1"
 
 observer:
+	podman pull -q "$$(python3 -c 'import sys; sys.path.insert(0, "."); from mvm import observer; print(observer.OBSERVER_IMAGE)')" >/dev/null
+	@echo "Pulled the observer's Python image (the fetch observer, on by default)"
+
+ndpi-oracle:
 	install -d "$(NDPI_SRC)"
 	@test -f "$(NDPI_SRC)/nDPI-5.0.tar.gz" || curl -fsSL -o "$(NDPI_SRC)/nDPI-5.0.tar.gz" "$(NDPI_URL)"
 	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-5.0.tar.gz" | sha256sum -c -
-	podman build -q -t localhost/mvm-observer:2 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
-	@echo "Built localhost/mvm-observer:2 (nDPI 5.0) (the fetch observer, on by default)"
+	podman build -q -t localhost/mvm-ndpi-oracle:5.0 -f "$(CURDIR)/egress/Containerfile.ndpi-oracle" "$(NDPI_SRC)" >/dev/null
+	@echo "Built localhost/mvm-ndpi-oracle:5.0 (nDPI 5.0, test oracle only)"
 
 # Daily `mvm check --all` (osv-scanner on every known project's lockfiles), as a user timer.
 timer:

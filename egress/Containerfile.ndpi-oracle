@@ -1,4 +1,4 @@
-# mvm observer: ndpiReader from upstream nDPI 5.0, the last all-LGPLv3 release (see Makefile);
+# Test oracle only (`make ndpi-oracle`): ndpiReader from nDPI 5.0, the last all-LGPLv3 release;
 # release tarball sha256-checked here and in the Makefile, on Debian pinned by digest. Built by `make observer`.
 FROM docker.io/library/debian@sha256:4876fdea29cac1a33a3195f1eb1952feb1fca7dd6dd00be3e2f1879cf20d34d2 AS build
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential autoconf automake libtool pkg-config libpcap-dev ca-certificates >/dev/null

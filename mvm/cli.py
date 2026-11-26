@@ -267,7 +267,7 @@ def cmd_status(args: list[str]) -> int:
     if not observer.enabled(cfg):
         print("observer off")
     elif observer.image_present():
-        print(f"observer on: nDPI flows (SNI, JA4, bytes) for every fetch ({observer.OBSERVER_IMAGE})")
+        print(f"observer on: TLS ClientHello per connection (SNI, JA4, bytes) for every fetch ({observer.OBSERVER_IMAGE})")
     else:
         print(f"observer on but MISSING image {observer.OBSERVER_IMAGE}: fetch refuses to run (make observer)")
     for name in ECOS:
