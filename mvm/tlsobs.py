@@ -291,7 +291,6 @@ class Tracker:
         self.flows: dict[tuple, Flow] = {}
         self.all: list[Flow] = []                # every flow, in order: a reused port never hides one
         self.overflow = 0
-        self.unparsed = 0                        # frames we could not read as IP/TCP to or from 443
 
     def packet(self, ip: bytes, outgoing: bool) -> None:
         t = _tcp(ip)
