@@ -98,7 +98,7 @@ def checked_layout(img: Path) -> bytes:
     for d in [m.get("config"), *m["layers"]]:
         if not isinstance(d, dict):
             raise bad("malformed descriptor")
-        dg, mt = d.get("digest"), str(d.get("mediaType", ""))
+        dg, mt = d.get("digest"), str(d.get("mediaType", "")).lower()
         if not isinstance(dg, str) or not dg.startswith("sha256:") or not HEX64.fullmatch(dg[7:]):
             raise bad(f"digest {dg!r}")
         if d.get("urls") or "foreign" in mt or "nondistributable" in mt:
