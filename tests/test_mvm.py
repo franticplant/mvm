@@ -53,7 +53,7 @@ class _Facade:
 def load_mvm():
     sys.path.insert(0, str(REPO))
     import importlib
-    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "pull", "cli"]
+    names = ["core", "ecos", "cache", "project", "egress", "observer", "check", "runtime", "pull", "imagebuild", "cli"]
     mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
     # reload in dependency order so cross-module imports see fresh objects
     return _Facade(mods)
@@ -380,6 +380,67 @@ class PullTests(Base):
         with mock.patch.object(sys.modules["mvm.core"].subprocess, "run", return_value=gone):
             with self.assertRaisesRegex(self.mvm.MvmError, "mvm pull docker.io/x/y:1"):
                 self.mvm.pinned("docker.io/x/y:1")
+
+
+class ImageBuildTests(Base):
+    def test_base_images_and_refusals(self):
+        ib = self.mvm.imagebuild
+        cf = ("# comment\nARG X=1\nFROM --platform=linux/amd64 docker.io/library/golang:1.27-alpine AS build\n"
+              "RUN go version \\\n  && echo ok\nFROM scratch\nCOPY --from=build /x /x\n"
+              "FROM build AS again\nFROM localhost/mine:1\nRUN <<EOF\nFROM docker.io/evil/inside:heredoc\nEOF\n"
+              "from docker.io/library/alpine:3.24\n")
+        self.assertEqual(ib.base_images(cf), ["docker.io/library/golang:1.27-alpine", "localhost/mine:1",
+                                              "docker.io/library/alpine:3.24"])
+        for bad in ("FROM alpine:3.24\n", "ARG B=x\nFROM docker.io/library/$B\n", "FROM\n",
+                    "FROM docker.io/library/alpine:3.24\nADD https://example.com/x /x\n",
+                    "FROM docker.io/library/alpine:3.24\nADD --chmod=644 git@github.com:a/b.git /b\n",
+                    "FROM docker.io/library/alpine:3.24\nRUN --network=host wget x\n",
+                    "FROM docker.io/library/alpine:3.24\nRUN --mount=type=cache,target=/c --network host true\n"):
+            with self.assertRaises(self.mvm.MvmError, msg=bad):
+                ib.base_images(bad)
+        ib.base_images("FROM docker.io/library/alpine:3.24\nADD ./local /x\nRUN echo --network=x\n")
+
+    def test_build_argv_is_krun_confined_and_offline_for_images(self):
+        net = self.mvm.vm_network_args(4321)
+        argv = self.mvm.imagebuild.build_argv("localhost/mvm-build-tmp:ab", Path("/ctx"), "2g", net, 4321)
+        self.assertEqual(argv[:4], ["podman", "--runtime", "krun", "build"])   # RUN steps in KVM
+        for flag in ("--pull=never", "--no-cache", "--layers=false", "--dns=none", *net):
+            self.assertIn(flag, argv)
+        self.assertNotIn("--network=host", argv)
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            self.assertIn(f"{k}=http://127.0.0.1:4321", argv)
+        self.assertEqual(argv[-1], "/ctx")
+        self.assertEqual(argv[argv.index("-f") + 1], "/ctx/Containerfile")
+        self.assertEqual(argv[argv.index("-t") + 1], "localhost/mvm-build-tmp:ab")
+
+    def test_context_holds_only_the_containerfile_and_failures_tag_nothing(self):
+        ib = self.mvm.imagebuild
+        self.write("Containerfile", "FROM scratch\n")
+        self.write(".env", "SECRET=1")
+        seen, calls = {}, []
+
+        def fake_execute(plan):
+            argv = plan.argv_fn(self.mvm.vm_network_args(1), 1)
+            ctx = Path(argv[-1])
+            seen["files"] = sorted(p.name for p in ctx.iterdir())
+            seen["plan"] = plan
+            return 3
+
+        def fake_run(argv, *a, **k):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(sys.modules["mvm.runtime"], "execute", fake_execute), \
+                mock.patch.object(ib.subprocess, "run", fake_run):
+            rc, _ = ib.build("localhost/x:1", self.proj / "Containerfile", {})
+        self.assertEqual(rc, 3)
+        self.assertEqual(seen["files"], ["Containerfile"])
+        self.assertEqual((seen["plan"].kind, seen["plan"].net), ("image-build", True))
+        self.assertIn("dl-cdn.alpinelinux.org", seen["plan"].allow)
+        self.assertFalse([c for c in calls if c[:2] == ["podman", "tag"]])           # nothing tagged
+        self.assertTrue([c for c in calls if c[:3] == ["podman", "rmi", "-f"]])        # temp image removed
+        for bad in ("docker.io/x:1", "localhost/x", "localhost/x@sha256:ab"):
+            with self.assertRaises(self.mvm.MvmError, msg=bad):
+                ib.build(bad, self.proj / "Containerfile", {})
 
 
 class EgressTests(Base):
@@ -1308,6 +1369,35 @@ class RealTests(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("HELD, nothing loaded", r.stderr)
         self.assertIn('[allow]  pull = ["quay.io"]', r.stderr)
+
+    def test_confined_image_build(self):
+        """Proves: mvm image build pulls a missing base through the egress, runs RUN steps in
+        krun with apk through the proxy, tags only a clean build, leaks no proxy env; a step
+        reaching a disallowed host is held (exit 3) and nothing is tagged."""
+        cf = self.proj / "Containerfile"
+        cf.write_text("FROM docker.io/library/busybox:1.37 AS b\nFROM docker.io/library/alpine:3.24\n"
+                      "COPY --from=b /bin/busybox /bb\nRUN apk add --no-cache jq && uname -r > /kernel\n")
+        tag = "localhost/mvm-test-build:1"
+        try:
+            r = self.mvm("image", "build", "-t", tag, "-f", str(cf))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            env = subprocess.run(["podman", "image", "inspect", "--format", "{{json .Config.Env}}", tag],
+                                 capture_output=True, text=True, check=True).stdout
+            self.assertNotIn("127.0.0.1", env)
+            r = self.mvm("run", "-i", tag, "--", "sh", "-c", "jq --version && cat /kernel")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("jq-", r.stdout)
+            self.assertNotEqual(r.stdout.split()[-1], os.uname().release)          # built in the guest kernel
+            cf.write_text("FROM docker.io/library/alpine:3.24\nRUN wget -q -O- https://example.com/ || true\n")
+            neg = "localhost/mvm-test-build:neg"
+            r = self.mvm("image", "build", "-t", neg, "-f", str(cf))
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertIn('[allow]  image-build = ["example.com"]', r.stderr)
+            self.assertNotEqual(subprocess.run(["podman", "image", "exists", neg]).returncode, 0)
+            tmp = subprocess.run(["podman", "images", "-q", "localhost/mvm-build-tmp"], capture_output=True, text=True)
+            self.assertEqual(tmp.stdout.strip(), "")
+        finally:
+            subprocess.run(["podman", "rmi", "-f", tag, "docker.io/library/busybox:1.37"], capture_output=True)
 
     def test_clean_commit(self):
         """Proves: a run that exits 0 commits its cache writes atomically and records the run."""

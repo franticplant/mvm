@@ -13,7 +13,7 @@ _mvm_completion() {
         [[ "${COMP_WORDS[i]}" == "--" ]] && { mapfile -t COMPREPLY < <(compgen -f -- "$cur"); return; }
     done
     if ((COMP_CWORD == 1)); then
-        mapfile -t COMPREPLY < <(compgen -W "fetch build run check status pull update cache" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "fetch build run check status pull update image cache" -- "$cur")
         return
     fi
     case "${COMP_WORDS[1]}" in

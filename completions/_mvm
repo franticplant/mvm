@@ -18,6 +18,7 @@ _mvm() {
     'status:config, checks, trips, images, caches, runs'
     'pull:pull an image through the egress and pin it'
     'update:re-pull and re-pin images'
+    'image:build an image confined (image build -t localhost/NAME:TAG)'
     'cache:manage cache images'
   )
   if (( CURRENT == 2 )); then

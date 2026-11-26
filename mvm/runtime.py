@@ -44,7 +44,9 @@ class Plan:
     gate: Callable[[], str] | None = None   # runs before commit; a non-empty reason refuses it
     notify: str = ""          # ntfy URL: post when the run trips (held, failed proxy/observer, malicious)
     quiet: bool = False       # the command's own output is shown only when it fails (osv-scanner)
-    volumes: list[str] = field(default_factory=list)    # extra -v specs (pull: CA bundle, output dir)
+    volumes: list[str] = field(default_factory=list)
+    # image build: the podman command from (confined network args, proxy port) instead of a VM run
+    argv_fn: Callable[[list[str], int], list[str]] | None = None    # extra -v specs (pull: CA bundle, output dir)
 
 
 def new_run_id() -> str:
@@ -223,7 +225,12 @@ def execute(plan: Plan) -> int:
                     net_args = egress.vm_network_args(px.port)
                     if plan.observe:
                         ob = stack.enter_context(observer.Observer(run_id, px.name, px.iface, plan.allow))
-                argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
+                if plan.argv_fn:
+                    if not plan.net:
+                        raise core.MvmError("argv_fn needs the confined network")
+                    argv = plan.argv_fn(net_args, px.port)
+                else:
+                    argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
                 try:
                     rc = run_podman(argv, plan.quiet, plan.ok_exit)
                 except KeyboardInterrupt:

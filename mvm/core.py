@@ -111,9 +111,9 @@ def load_config() -> dict:
         die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false and log = \"/abs/path/flows.jsonl\"")
     allow = cfg.get("allow", {})
     if not isinstance(allow, dict) or not all(
-            k in (*ECOS, "pull") and isinstance(v, list) and all(valid_allow_host(h) for h in v)
+            k in (*ECOS, "pull", "image-build") and isinstance(v, list) and all(valid_allow_host(h) for h in v)
             for k, v in allow.items()):
-        die(f"{CONFIG_PATH}: [allow] keys must be {sorted((*ECOS, 'pull'))} with lists of host names")
+        die(f"{CONFIG_PATH}: [allow] keys must be {sorted((*ECOS, 'pull', 'image-build'))} with lists of host names")
     mask = cfg.get("mask", DEFAULT_MASK)
     if not isinstance(mask, list) or not all(isinstance(m, str) and m for m in mask):
         die(f"{CONFIG_PATH}: mask must be a list of non-empty strings")

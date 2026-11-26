@@ -33,6 +33,11 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .br
 .B mvm update
 .br
+.B mvm image build \-t
+.IR localhost/NAME:TAG
+.RB [ \-f
+.IR FILE ]
+.br
 .B mvm cache
 .BR rm " NAME | " grow " NAME SIZE | " gc
 .SH DESCRIPTION
@@ -184,6 +189,20 @@ manifest; the download is then removed.
 A registry outside the allowlist holds the pull (exit 3).
 Built\-in registries: Docker Hub and GHCR; others with
 .BR "[allow] pull" .
+.PP
+.B mvm image build
+runs
+.BR "podman \-\-runtime krun build" :
+every RUN step runs in a KVM microVM on the confined network of fetch (proxy, TCP 443
+only, observer), allowing only OS package mirrors (Alpine, Debian; more with
+.BR "[allow] image\-build" ).
+The build context holds only the Containerfile. Missing base images are pulled
+through the egress first, then the build runs with
+.BR "\-\-pull=never \-\-no\-cache" .
+The result gets the requested
+.I localhost/
+tag only after a clean run; otherwise the temporary image is deleted (exit 3, 4 or 5).
+ADD of a URL, RUN \-\-network and FROM with variables are refused.
 .SH FILES
 .TP
 .I ~/.config/mvm/config.toml
@@ -193,7 +212,7 @@ Optional:
 .B [images]
 (go, rust, node),
 .B [allow]
-(go, rust, node: lists of extra hosts for fetch; pull: extra registry hosts),
+(go, rust, node: lists of extra hosts for fetch; pull: extra registry hosts; image\-build: extra OS mirrors),
 .B [memory]
 (go, rust, node, run),
 .B [observer]

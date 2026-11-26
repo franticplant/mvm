@@ -32,6 +32,9 @@ DEFAULT_ALLOW = {
              "production.cloudflare.docker.com",
              "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
              "ghcr.io", "pkg-containers.githubusercontent.com"],
+    # mvm image build: OS package mirrors over HTTPS (443 only: a sources list on http://
+    # fails; Debian's mirrors serve https). Others: [allow] image-build = [...].
+    "image-build": ["dl-cdn.alpinelinux.org", "deb.debian.org", "security.debian.org"],
 }
 # alpine 3.24 by digest, the base of the firewall image (`make smokescreen` brings it):
 # by tag, a fresh machine would pull it through the very proxy it is about to run.

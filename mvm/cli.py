@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import check, core, egress, observer, pull
+from . import check, core, egress, imagebuild, observer, pull
 from .cache import cache_img, cache_meta, run_copies, try_exclusive
 from .core import DEFAULT_MASK, MvmError, die, find_sbin, load_config, now_iso, pinned, pins_path, read_json, resolve_digest, say, write_json_atomic
 from .ecos import ECOS, Eco, eco_caches
@@ -329,6 +329,7 @@ def cmd_status(args: list[str]) -> int:
     why = pull.ready()
     print(f"pull     {'MISSING: ' + why if why else 'images through the egress proxy (' + pull.SKOPEO_IMAGE + ')'}")
     print(f"  allow pull  {', '.join(egress.allowlist(cfg, 'pull'))}")
+    print(f"image build  RUN steps in krun, egress through the proxy: {', '.join(egress.allowlist(cfg, 'image-build'))}")
     print(f"check    {'before every fetch' if check.before_fetch(cfg) else 'OFF before fetch'}"
           f" (osv-scanner {check.OSV_IMAGE.rsplit(':', 1)[1]}, MAL- advisories block)")
     print(f"notify   {'ntfy on trips' if check.notify_url(cfg) else 'off'}")
@@ -381,6 +382,30 @@ def cmd_status(args: list[str]) -> int:
     if not recs:
         print("  (none)")
     return 0
+
+
+def cmd_image(args: list[str]) -> int:
+    usage = "usage: mvm image build -t localhost/NAME:TAG [-f Containerfile]"
+    if not args or args[0] != "build":
+        die(usage)
+    tag, cf, rest = None, "Containerfile", args[1:]
+    while rest:
+        if rest[0] in ("-t", "-f") and len(rest) > 1:
+            if rest[0] == "-t":
+                tag = rest[1]
+            else:
+                cf = rest[1]
+            rest = rest[2:]
+        else:
+            die(usage)
+    if not tag:
+        die(usage)
+    cfg = load_config()
+    rc, eg = imagebuild.build(tag, Path(cf).resolve(), cfg)
+    hosts = allowable(eg, egress.allowlist(cfg, "image-build")) if rc == core.EXIT_EGRESS_DENIED else []
+    if hosts:
+        suggest_allow("image-build", cfg, hosts)
+    return rc
 
 
 def cmd_cache(args: list[str]) -> int:
@@ -466,6 +491,10 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
   mvm status                           config, checks, trips, pinned images, caches, runs
   mvm pull IMAGE                       pull an image (through the egress) and pin it
   mvm update                           re-pull and re-pin images (through the egress)
+  mvm image build -t localhost/NAME:TAG [-f FILE]
+                                       build an image: RUN steps in krun microVMs, egress
+                                       only through the proxy (OS mirrors), context = the
+                                       Containerfile alone; tagged only after a clean run
   mvm cache rm NAME | grow NAME SIZE | gc
 
   -v       (first) verbose: per-run egress, observer and scanner details
@@ -504,7 +533,7 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, _sigterm)
     core.ensure_state_dir()
     cmds = {"fetch": cmd_fetch, "build": cmd_build, "run": cmd_run, "status": cmd_status, "check": cmd_check,
-            "update": cmd_update, "pull": cmd_pull, "cache": cmd_cache}
+            "update": cmd_update, "pull": cmd_pull, "image": cmd_image, "cache": cmd_cache}
     fn = cmds.get(argv[0])
     if fn is None:
         die(f"unknown command {argv[0]!r} (see mvm --help)")
