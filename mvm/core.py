@@ -105,8 +105,10 @@ def load_config() -> dict:
             or (url and not re.fullmatch(r"https://[^\s/]+/\S+|http://(127\.0\.0\.1|localhost):\d+/\S*", url))):
         die(f"{CONFIG_PATH}: [notify] takes only ntfy = \"https://ntfy.example/<topic>\"")
     obs = cfg.get("observer", {})
-    if not isinstance(obs, dict) or set(obs) - {"enabled"} or not isinstance(obs.get("enabled", False), bool):
-        die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false")
+    if (not isinstance(obs, dict) or set(obs) - {"enabled", "log"} or not isinstance(obs.get("enabled", False), bool)
+            or not isinstance(obs.get("log", ""), str)
+            or (obs.get("log") and not os.path.isabs(os.path.expanduser(obs["log"])))):
+        die(f"{CONFIG_PATH}: [observer] takes only enabled = true|false and log = \"/abs/path/flows.jsonl\"")
     allow = cfg.get("allow", {})
     if not isinstance(allow, dict) or not all(
             k in (*ECOS, "pull") and isinstance(v, list) and all(valid_allow_host(h) for h in v)
@@ -131,6 +133,12 @@ def write_json_atomic(path: Path, data) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, path)
+
+
+def ensure_state_dir() -> None:
+    """Run records name projects, hosts and flows: the state dir is the user's only (0700)."""
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_ROOT, 0o700)
 
 
 def read_json(path: Path, default):

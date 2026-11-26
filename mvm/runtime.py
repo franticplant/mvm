@@ -241,6 +241,13 @@ def execute(plan: Plan) -> int:
                     rec["observer"] = {**ob.summary, "healthy": ob.healthy, "unobserved_connections": missed,
                                        "capture": getattr(ob, "stats", None)}
                     plan.egress_result = {**rec["egress"], "observer": rec["observer"]}
+                    log = observer.log_path(core.load_config())      # opt-in ETA corpus
+                    if log:
+                        try:
+                            observer.append_log(log, {"run_id": run_id, "kind": plan.kind, "eco": plan.eco},
+                                                ob.summary["flows"])
+                        except OSError as e:           # observe-only: a full disk never blocks a run
+                            say(f"{label}: could not append to the observer log {log}: {e}")
                     core.detail(f"{label}: {observer.summary_line(ob.summary)}")
             observed_ok = not (plan.net and plan.observe) or ob.healthy
             sni_outside = plan.net and plan.observe and ob.summary["outside_allowlist"]

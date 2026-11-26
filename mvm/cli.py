@@ -502,6 +502,7 @@ def main(argv: list[str]) -> int:
         print(USAGE, end="")
         return 0
     signal.signal(signal.SIGTERM, _sigterm)
+    core.ensure_state_dir()
     cmds = {"fetch": cmd_fetch, "build": cmd_build, "run": cmd_run, "status": cmd_status, "check": cmd_check,
             "update": cmd_update, "pull": cmd_pull, "cache": cmd_cache}
     fn = cmds.get(argv[0])

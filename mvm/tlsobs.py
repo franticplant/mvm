@@ -175,10 +175,15 @@ def _alpn_chars(alpn: list[bytes]) -> str:
     return h[0] + h[-1]
 
 
+def tls_version(h: dict) -> str:
+    """Highest offered version, as in JA4 ("13", "12", ...; "00" unknown)."""
+    versions = [v for v in h["versions"] if v in TLS_VERSIONS]      # drops GREASE and unknown drafts
+    return TLS_VERSIONS.get(max(versions) if versions else h["legacy_version"], "00")
+
+
 def ja4(h: dict, transport: str = "t") -> str:
     """JA4 (TLS client) per FoxIO's BSD-3 specification."""
-    versions = [v for v in h["versions"] if v in TLS_VERSIONS]      # drops GREASE and unknown drafts
-    ver = TLS_VERSIONS.get(max(versions) if versions else h["legacy_version"], "00")
+    ver = tls_version(h)
     ciphers = [c for c in h["ciphers"] if not is_grease(c)]
     exts = [e for e in h["extensions"] if not is_grease(e)]
     a = (f"{transport}{ver}{'d' if EXT_SNI in exts else 'i'}"
@@ -200,7 +205,9 @@ def classify(stream: bytes) -> dict | None:
         return None
     except NotHello as e:
         return {"proto": "non-TLS", "why": str(e)}
-    return {"proto": "TLS", "sni": h["sni"] or "", "ja4": ja4(h)}
+    return {"proto": "TLS", "sni": h["sni"] or "", "ja4": ja4(h),
+            "alpn": h["alpn"][0].decode("ascii", "backslashreplace") if h["alpn"] else "",
+            "tls_version": tls_version(h)}
 
 
 # ---------------------------------------------------------------- TCP reassembly
@@ -209,11 +216,24 @@ def _rel(seq: int, base: int) -> int:
     return (seq - base) & 0xffffffff
 
 
-class Flow:
-    """One outbound TCP connection to port 443, keyed by its 4-tuple."""
+SPLT_LEN = 20                                    # data packets kept per flow for the ETA sequence
 
-    def __init__(self, dst: str, isn: int):
+
+class Flow:
+    """One outbound TCP connection to port 443, keyed by its 4-tuple.
+
+    Besides the ClientHello it keeps observe-only encrypted-traffic-analysis features
+    (nothing is enforced on them): kernel timestamps of the first and last packet,
+    packet counts each way, and SPLT, the first SPLT_LEN data-carrying packets as
+    [signed payload length (+ out, - in), ms since the previous data packet (the first:
+    since the SYN)]."""
+
+    def __init__(self, dst: str, isn: int, ts: float = 0.0):
         self.dst, self.isn = dst, isn
+        self.t_start = self.t_last = self.t_data = ts
+        self.pkts_out = 1                         # the SYN
+        self.pkts_in = 0
+        self.splt: list[list] = []
         self.established = False
         self.server_isn: int | None = None
         self.buf = bytearray()                   # client bytes from offset 0, until classified
@@ -276,12 +296,29 @@ class Flow:
         if off <= 0x7fffffff:
             self.in_end = max(self.in_end, off + n)
 
+    def seen(self, ts: float, outgoing: bool, payload_len: int) -> None:
+        """Count one packet of this flow (timestamps from the kernel ring)."""
+        if outgoing:
+            self.pkts_out += 1
+        else:
+            self.pkts_in += 1
+        self.t_last = max(self.t_last, ts)
+        if payload_len and len(self.splt) < SPLT_LEN:
+            self.splt.append([payload_len if outgoing else -payload_len,
+                              round(max(0.0, ts - self.t_data) * 1000, 3)])
+            self.t_data = ts
+
     def record(self) -> dict:
         r = self.result or {"proto": "non-TLS", "why": "connection ended before a ClientHello"
                             if self.closed else "no ClientHello seen"}
+        total = self.out_end + self.in_end
         return {"dst": self.dst, "dst_port": PORT, "proto": r["proto"], "sni": r.get("sni", ""),
                 "ja4": r.get("ja4", ""), "why": r.get("why", ""), "fault": self.fault,
-                "bytes_out": self.out_end, "bytes_in": self.in_end}
+                "bytes_out": self.out_end, "bytes_in": self.in_end,
+                "ts_start": self.t_start, "duration_ms": round((self.t_last - self.t_start) * 1000, 3),
+                "pkts_out": self.pkts_out, "pkts_in": self.pkts_in,
+                "data_ratio": round(self.out_end / total, 4) if total else None,
+                "alpn": r.get("alpn", ""), "tls_version": r.get("tls_version", ""), "splt": self.splt}
 
 
 class Tracker:
@@ -292,7 +329,7 @@ class Tracker:
         self.all: list[Flow] = []                # every flow, in order: a reused port never hides one
         self.overflow = 0
 
-    def packet(self, ip: bytes, outgoing: bool) -> None:
+    def packet(self, ip: bytes, outgoing: bool, ts: float = 0.0) -> None:
         t = _tcp(ip)
         if t is None:
             return
@@ -305,11 +342,14 @@ class Tracker:
                     if len(self.all) >= MAX_FLOWS:
                         self.overflow += 1
                         return
-                    self.flows[key] = Flow(dst, seq)
+                    self.flows[key] = Flow(dst, seq, ts)
                     self.all.append(self.flows[key])
-                return                                     # else a retransmitted SYN
+                else:                                      # a retransmitted SYN
+                    f.seen(ts, True, 0)
+                return
             if f is None:
                 return                                     # started before the capture: unobserved
+            f.seen(ts, True, payload_len)
             if flags & 0x20 and f.result is None:
                 f.fault = "TCP urgent data"               # never from Smokescreen's own stack
             if payload_len and payload is None:
@@ -322,6 +362,7 @@ class Tracker:
             f = self.flows.get((dst, dport, src, sport))
             if f is None:
                 return
+            f.seen(ts, False, payload_len)
             if flags & 0x12 == 0x12:                       # SYN-ACK
                 f.established, f.server_isn = True, seq
                 return
@@ -424,7 +465,7 @@ def _ring(s: socket.socket):
 
 
 def _blocks(ring, start: int):
-    """Yield (block_index, [(ip_bytes, outgoing)]) for every block the kernel handed over,
+    """Yield (block_index, [(ip_bytes, outgoing, kernel_timestamp)]) for every block the kernel handed over,
     starting at `start`, and give each block back after its frames are read."""
     i = start
     while True:
@@ -434,9 +475,9 @@ def _blocks(ring, start: int):
             return
         frames, off = [], base + first
         for _ in range(num):
-            nxt, _sec, _nsec, snap, _len, _st, mac, net = struct.unpack_from("=IIIIIIHH", ring, off)
+            nxt, sec, nsec, snap, _len, _st, mac, net = struct.unpack_from("=IIIIIIHH", ring, off)
             pkttype = ring[off + 48 + 10]                       # sockaddr_ll.sll_pkttype
-            frames.append((ring[off + net:off + mac + snap], pkttype == PACKET_OUTGOING))
+            frames.append((ring[off + net:off + mac + snap], pkttype == PACKET_OUTGOING, sec + nsec / 1e9))
             off += nxt
         struct.pack_into("=I", ring, base + 8, 0)               # TP_STATUS_KERNEL: give it back
         i = (i + 1) % RING_BLOCKS
@@ -463,13 +504,13 @@ def capture(iface: str, out: str, pcap: str | None = None) -> int:
         for following, frames in _blocks(ring, nxt):
             seen += len(frames)
             nxt = following                     # resume here next time
-            for ip, outgoing in frames:
+            for ip, outgoing, ts in frames:
                 if not ip or ip[0] >> 4 not in (4, 6):
                     continue
                 packets += 1
-                tr.packet(ip, outgoing)
+                tr.packet(ip, outgoing, ts)
                 if pw and outgoing:
-                    pw.write(time.time(), ip, len(ip))
+                    pw.write(ts, ip, len(ip))
         return seen
 
     while not stop:

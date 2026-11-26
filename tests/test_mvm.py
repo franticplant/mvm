@@ -188,6 +188,35 @@ class ConfigTests(Base):
         self.mvm.CONFIG_PATH.write_text('mask = [".env"]\n[images]\ngo = "x:1"\n[memory]\nrun = "1g"\n')
         self.assertEqual(self.mvm.load_config()["mask"], [".env"])
 
+    def test_eta_fields_are_sanitized_and_logged_opt_in(self):
+        line = json.dumps({"dst": "1.1.1.1", "dst_port": 443, "proto": "TLS", "sni": "a.example", "ja4": "j",
+                           "ts_start": 1.5, "duration_ms": 9, "pkts_out": 3, "pkts_in": True, "data_ratio": 0.25,
+                           "alpn": "h2", "tls_version": "13",
+                           "splt": [[517, 1.0], [-1400, "x"], [1, 2, 3], [-90, 0.5]] + [[1, 1.0]] * 30})
+        f = self.mvm.observer.summarize([line], ["a.example"])["flows"][0]
+        self.assertEqual((f["pkts_in"], f["duration_ms"], f["alpn"]), (None, 9.0, "h2"))   # a bool is no count
+        self.assertEqual(f["splt"][:2], [[517, 1.0], [-90, 0.5]])
+        self.assertEqual(len(f["splt"]), 20)
+        self.assertIsNone(self.mvm.observer.log_path(self.mvm.load_config()))               # off by default
+        log = Path(self.tmp.name) / "corpus" / "flows.jsonl"
+        self.mvm.CONFIG_PATH.write_text(f'[observer]\nlog = "{log}"\n')
+        self.assertEqual(self.mvm.observer.log_path(self.mvm.load_config()), log)
+        for _ in range(2):
+            self.mvm.observer.append_log(log, {"run_id": "R", "kind": "fetch", "eco": "go"}, [f])
+        rows = [json.loads(x) for x in log.read_text().splitlines()]
+        self.assertEqual([(r["run_id"], r["kind"], r["eco"], r["sni"]) for r in rows], [("R", "fetch", "go", "a.example")] * 2)
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        for bad in ('[observer]\nlog = "relative.jsonl"\n', '[observer]\nlog = 1\n'):
+            self.mvm.CONFIG_PATH.write_text(bad)
+            with self.assertRaises(SystemExit, msg=bad):
+                self.mvm.load_config()
+
+    def test_state_dir_is_private(self):
+        self.mvm.STATE_ROOT.mkdir(mode=0o755)
+        os.chmod(self.mvm.STATE_ROOT, 0o755)  # noqa: S103  (the old default, to be tightened)
+        self.mvm.ensure_state_dir()
+        self.assertEqual(self.mvm.STATE_ROOT.stat().st_mode & 0o777, 0o700)
+
     def test_observer_config(self):
         self.assertTrue(self.mvm.observer.enabled(self.mvm.load_config()))      # on by default
         self.mvm.CONFIG_PATH.write_text("[observer]\nenabled = false\n")
@@ -671,6 +700,36 @@ class TlsSensorTests(Base):
         self.assertEqual(tr.overflow, 3)
 
 
+    def test_eta_features(self):
+        """Observe-only ETA fields: kernel timestamps, packet counts, data ratio, ALPN, version, SPLT."""
+        t = self.mvm.tlsobs
+        tr = t.Tracker()
+        stream = bytes.fromhex(self.HELLOS[1]["stream_hex"])          # Python urllib: ALPN http/1.1
+        c, s = "10.0.0.2", "1.1.1.1"
+        t0 = 1795700000.0
+        tr.packet(self.ip4(c, s, 40000, 443, 100, 0x02), True, t0)                          # SYN
+        tr.packet(self.ip4(s, c, 443, 40000, 9000, 0x12), False, t0 + 0.010)                # SYN-ACK
+        tr.packet(self.ip4(c, s, 40000, 443, 101, 0x10), True, t0 + 0.011)                  # ACK, no data
+        tr.packet(self.ip4(c, s, 40000, 443, 101, 0x18, stream), True, t0 + 0.012)
+        tr.packet(self.ip4(s, c, 443, 40000, 9001, 0x18, b"y" * 3000)[:60], False, t0 + 0.050)
+        for i in range(25):                                                             # more than SPLT_LEN
+            tr.packet(self.ip4(s, c, 443, 40000, 12001 + i * 100, 0x10, b"z" * 100)[:60], False, t0 + 0.060 + i / 1000)
+        tr.packet(self.ip4(c, s, 40000, 443, 101 + len(stream), 0x11), True, t0 + 0.200)    # FIN
+        r = tr.records()[0]
+        self.assertEqual((r["alpn"], r["tls_version"]), ("http/1.1", "13"))
+        self.assertEqual(r["ts_start"], t0)
+        self.assertAlmostEqual(r["duration_ms"], 200.0, places=2)
+        self.assertEqual((r["pkts_out"], r["pkts_in"]), (4, 27))
+        self.assertEqual(r["data_ratio"], round(len(stream) / (len(stream) + 12001 + 24 * 100 + 100 - 9001), 4))
+        self.assertEqual(len(r["splt"]), t.SPLT_LEN)
+        self.assertEqual(r["splt"][0], [len(stream), 12.0])                 # first: since the SYN
+        self.assertEqual(r["splt"][1], [-3000, 38.0])                       # inbound is negative
+        self.assertEqual(r["splt"][2], [-100, 10.0])
+        json.dumps(r)                                                       # a flow line stays JSON
+        f = t.Flow("1.1.1.1", 1)
+        self.assertIsNone(f.record()["data_ratio"])                         # no bytes: no ratio
+
+
 class ObserverTests(Base):
     # One flow line as the sensor writes it (real values: registry.npmjs.org via wget).
     REAL = ('{"dst": "104.16.9.34", "dst_port": 443, "proto": "TLS", "sni": "registry.npmjs.org", '
@@ -680,9 +739,12 @@ class ObserverTests(Base):
 
     def test_summarize_real_flow(self):
         s = self.mvm.observer.summarize([self.REAL, self.DNS, "garbage", "[]"], ["registry.npmjs.org"])
-        self.assertEqual(s["flows"], [{"sni": "registry.npmjs.org", "ja4": "t13d301100_1d37bd780c83_8e6e362c5eac",
-                                       "dst": "104.16.9.34", "proto": "TLS", "why": "", "fault": "",
-                                       "bytes_out": 1759, "bytes_in": 26661}])
+        keys = ("sni", "ja4", "dst", "proto", "why", "fault", "bytes_out", "bytes_in")
+        self.assertEqual([{k: f[k] for k in keys} for f in s["flows"]],
+                         [{"sni": "registry.npmjs.org", "ja4": "t13d301100_1d37bd780c83_8e6e362c5eac",
+                           "dst": "104.16.9.34", "proto": "TLS", "why": "", "fault": "",
+                           "bytes_out": 1759, "bytes_in": 26661}])
+        self.assertEqual((s["flows"][0]["splt"], s["flows"][0]["pkts_out"]), ([], None))   # older lines
         self.assertEqual(s["outside_allowlist"], [])
         self.assertIn("JA4 t13d301100", self.mvm.observer.summary_line(s))
 

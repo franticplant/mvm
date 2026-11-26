@@ -83,6 +83,36 @@ def _lines_ok(lines: list[str] | None) -> bool:
     return True
 
 
+def _num(v, kind=float):
+    return kind(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def eta(d: dict) -> dict:
+    """Observe-only encrypted-traffic-analysis fields (nothing is enforced on them)."""
+    splt = d.get("splt") if isinstance(d.get("splt"), list) else []
+    return {"ts_start": _num(d.get("ts_start")), "duration_ms": _num(d.get("duration_ms")),
+            "pkts_out": _num(d.get("pkts_out"), int), "pkts_in": _num(d.get("pkts_in"), int),
+            "data_ratio": _num(d.get("data_ratio")), "alpn": str(d.get("alpn") or ""),
+            "tls_version": str(d.get("tls_version") or ""),
+            "splt": [[int(p[0]), float(p[1])] for p in splt
+                     if isinstance(p, list) and len(p) == 2 and _num(p[0], int) is not None
+                     and _num(p[1]) is not None][:20]}
+
+
+def log_path(cfg: dict) -> Path | None:
+    """[observer] log = "/path/flows.jsonl": opt-in, appends every flow with run metadata."""
+    p = cfg.get("observer", {}).get("log", "")
+    return Path(p).expanduser() if p else None
+
+
+def append_log(path: Path, run: dict, flows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        for fl in flows:
+            f.write(json.dumps({**run, **fl}, sort_keys=True) + "\n")
+
+
 def summarize(lines: list[str], allow: list[str]) -> dict:
     """The sensor's flow lines -> summary.
 
@@ -103,7 +133,8 @@ def summarize(lines: list[str], allow: list[str]) -> dict:
         flows.append({"sni": str(d.get("sni") or ""), "ja4": str(d.get("ja4") or ""), "dst": str(d.get("dst", "")),
                       "proto": str(d.get("proto", "")), "why": str(d.get("why") or ""),
                       "fault": str(d.get("fault") or ""),
-                      "bytes_out": int(d.get("bytes_out", 0) or 0), "bytes_in": int(d.get("bytes_in", 0) or 0)})
+                      "bytes_out": int(d.get("bytes_out", 0) or 0), "bytes_in": int(d.get("bytes_in", 0) or 0),
+                      **eta(d)})
     outside = set()
     for f in flows:
         if f["fault"]:

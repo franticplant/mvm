@@ -197,14 +197,17 @@ Optional:
 .B [memory]
 (go, rust, node, run),
 .B [observer]
-(enabled = true|false, default true),
+(enabled = true|false, default true; log = "/abs/path.jsonl", opt\-in: append every
+flow with its ETA features and run id, kind and eco),
 .B [check]
 (before_fetch = true|false, default true),
 .B [notify]
 (ntfy = "https://ntfy.example/<topic>").
 .TP
 .I ~/.local/state/mvm/runs/
-One JSON record per run (last 200).
+One JSON record per run (last 200); observed runs include per\-flow ETA features
+(timestamps, packets each way, data ratio, ALPN, TLS version, SPLT), observe\-only.
+The state directory is kept 0700.
 .TP
 .I ~/.local/state/mvm/checks/
 Last check result per project.
