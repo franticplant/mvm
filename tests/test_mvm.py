@@ -50,7 +50,7 @@ class _Facade:
 def load_mvm():
     sys.path.insert(0, str(REPO))
     import importlib
-    names = ["core", "ecos", "cache", "project", "egress", "runtime", "cli"]
+    names = ["core", "ecos", "cache", "project", "egress", "observer", "runtime", "cli"]
     mods = [importlib.reload(importlib.import_module(f"mvm.{n}")) for n in names]
     # reload in dependency order so cross-module imports see fresh objects
     return _Facade(mods)
@@ -185,9 +185,15 @@ class ConfigTests(Base):
         self.mvm.CONFIG_PATH.write_text('mask = [".env"]\n[images]\ngo = "x:1"\n[memory]\nrun = "1g"\n')
         self.assertEqual(self.mvm.load_config()["mask"], [".env"])
 
+    def test_observer_config(self):
+        self.assertFalse(self.mvm.observer.enabled(self.mvm.load_config()))     # off by default
+        self.mvm.CONFIG_PATH.write_text("[observer]\nenabled = true\n")
+        self.assertTrue(self.mvm.observer.enabled(self.mvm.load_config()))
+
     def test_wrong_shapes_rejected(self):
         for bad in ('mask = ".env"\n', 'mask = [""]\n', 'masks = []\n', '[images]\npython = "x"\n',
-                    '[memory]\ngo = "lots"\n', 'mask = [\n'):
+                    '[memory]\ngo = "lots"\n', 'mask = [\n', '[observer]\nenabled = "yes"\n',
+                    '[observer]\nenabled = true\nmode = "x"\n', 'observer = true\n'):
             self.mvm.CONFIG_PATH.write_text(bad)
             with self.assertRaises(SystemExit, msg=bad):
                 self.mvm.load_config()
@@ -323,6 +329,10 @@ class EgressTests(Base):
         self.assertIn("th dport 53 accept", fw)            # DNS only to the pod's resolver
         self.assertNotIn("dport 80", fw)
         self.assertIn("table inet", fw)                     # IPv4 and IPv6
+        for rng in ("10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"):
+            self.assertIn(rng, fw)
+        # the private-range reject must come before the 443 accept
+        self.assertLess(fw.index("100.64.0.0/10"), fw.index("tcp dport 443 accept"))
 
     def _start_with(self, fw_stdout, fw_rc=0):
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
@@ -352,6 +362,12 @@ class EgressTests(Base):
         self.assertIn("/smokescreen", calls[2])
         self.assertIn("--cap-drop=all", calls[2])
         self.assertNotIn("--cap-add=NET_ADMIN", calls[2])        # proxy runs with no capabilities
+
+    def test_firewall_sets_mtu_and_reports_interface(self):
+        fw = self.mvm.FIREWALL_SH
+        self.assertLess(fw.index("mtu 1500"), fw.index("nft -f"))
+        calls = self._start_with("MVM_IF=wlp4s0\nMVM_EGRESS_FIREWALL_LOADED\n")
+        self.assertIn("--cap-add=NET_ADMIN", calls[1])
 
     def test_proxy_refuses_when_firewall_does_not_load(self):
         with self.assertRaises(self.mvm.MvmError):
@@ -386,6 +402,63 @@ class EgressTests(Base):
         line = self.mvm.summary_line(s)
         self.assertIn("DENIED: evil.example (1x)", line)
         self.assertIn("outside the allowlist (learn mode): storage.googleapis.com", line)
+
+
+class ObserverTests(Base):
+    # One flow line as real ndpiReader 6.0 wrote it in a proxy pod (trimmed), registry.npmjs.org via curl.
+    REAL = ('{"src_ip":"10.5.29.71","dest_ip":"104.16.3.34","src_port":55322,"dst_port":443,"ip":4,'
+            '"ndpi":{"proto":"TLS","hostname":"registry.npmjs.org","tls":{"version":"TLSv1.2",'
+            '"ja4":"t13d3513h2_bfa337485184_8d7351bd871b"}},'
+            '"xfer":{"src2dst_goodput_bytes":1949,"dst2src_goodput_bytes":26332}}')
+    DNS = '{"dest_ip":"169.254.1.1","dst_port":53,"ndpi":{"proto":"DNS","hostname":"registry.npmjs.org"}}'
+
+    def test_summarize_real_flow(self):
+        s = self.mvm.observer.summarize([self.REAL, self.DNS, "Welcome to nDPI", "[]"], ["registry.npmjs.org"])
+        self.assertEqual(s["flows"], [{"sni": "registry.npmjs.org", "ja4": "t13d3513h2_bfa337485184_8d7351bd871b",
+                                       "dst": "104.16.3.34", "proto": "TLS", "bytes_out": 1949, "bytes_in": 26332}])
+        self.assertEqual(s["outside_allowlist"], [])
+        self.assertIn("JA4 t13d3513h2", self.mvm.observer.summary_line(s))
+
+    def test_sni_outside_allowlist_and_missing_sni(self):
+        fronted = self.REAL.replace("registry.npmjs.org", "evil.example")
+        no_sni = self.REAL.replace('"hostname":"registry.npmjs.org",', "")
+        sub = self.REAL.replace("registry.npmjs.org", "Codeload.GitHub.com.")
+        s = self.mvm.observer.summarize([fronted, no_sni, sub, self.REAL], ["registry.npmjs.org", "*.github.com"])
+        self.assertEqual(len(s["flows"]), 4)
+        self.assertEqual(s["outside_allowlist"], ["(no sni)", "evil.example"])
+        self.assertIn("SNI OUTSIDE THE ALLOWLIST", self.mvm.observer.summary_line(s))
+        self.assertEqual(self.mvm.observer.summarize([sub], ["*.codeload.github.com"])["outside_allowlist"],
+                         ["Codeload.GitHub.com."])          # *.x never matches x itself
+        m = self.mvm.observer._matches
+        self.assertTrue(m("a.b.github.com", ["*.github.com"]))        # any depth, as Smokescreen
+        for bad in (".github.com", "a..github.com", "github.com", "evilgithub.com", ""):
+            self.assertFalse(m(bad, ["*.github.com"]), bad)
+
+    def test_stop_health_needs_clean_exit_flows_and_zero_discarded(self):
+        cases = [("Discarded bytes:       0\n", "0", True, self.REAL), ("Discarded bytes:       23222\n", "0", False, self.REAL),
+                 ("", "0", False, self.REAL),          # flows but no stats line: not trusted
+                 ("", "0", True, ""),                  # zero packets: ndpiReader prints no stats
+                 ("Discarded bytes: 0\n", "137", False, self.REAL)]
+        for logs, code, healthy, flows in cases:
+            ob = self.mvm.observer.Observer("RID", "pod", "eth0", ["a.org"])
+            ob._dir = tempfile.TemporaryDirectory()
+            (Path(ob._dir.name) / "flows.json").write_text(flows + "\n")
+            ret = subprocess.CompletedProcess([], 0, code + "\n", "")
+            with mock.patch.object(ob, "_running", return_value=True), \
+                    mock.patch.object(ob, "_logs", return_value=logs), \
+                    mock.patch("subprocess.run", return_value=ret):
+                lines = ob._stop()
+            self.assertEqual(ob.healthy, healthy, (logs, code, flows[:9]))
+            self.assertEqual(len(lines), 1)
+            ob._dir.cleanup()
+
+    def test_sidecar_is_capture_only(self):
+        argv = self.mvm.observer.sidecar_argv("pod", "pod-observer", "RID", "eth0", Path("/o"))
+        for flag in ("--cap-drop=all", "--cap-add=NET_RAW", "--read-only", "no-new-privileges",
+                     "--pids-limit", "--memory", "mvm.run=RID", "SIGINT"):
+            self.assertIn(flag, argv)
+        self.assertNotIn("--cap-add=NET_ADMIN", argv)
+        self.assertEqual([a for a in argv if a.startswith("-v") or ":/" in a], ["-v", "/o:/out:z"])
 
 
 class CommitTests(Base):
@@ -463,9 +536,17 @@ class CommitTests(Base):
         self.assertEqual(self.last_record()["result"], "learned")
         self.assertEqual(self.last_record()["egress"]["mode"], "learn")
 
-    def _net_run(self, summary, healthy=True):
+    def _net_run(self, summary, healthy=True, observed=None):
+        """observed: None = observer off, else (observer summary, observer healthy)."""
         class FakeProxy:
-            def __init__(self, *a): self.port = 1; self.healthy = healthy; self.summary = summary
+            def __init__(self, *a):
+                self.port = 1; self.healthy = healthy; self.summary = summary
+                self.name = "pod"; self.iface = "eth0"
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+        class FakeObserver:
+            def __init__(self, *a):
+                self.summary, self.healthy = observed
             def __enter__(self): return self
             def __exit__(self, *e): return False
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
@@ -476,11 +557,58 @@ class CommitTests(Base):
             Path(src).write_bytes(b"WRITTEN")
             return 0
         plan = self.mvm.Plan(kind="fetch", eco="go", image="i", memory="1g", cmd=["x"], src=None,
-                             caches=[self.cache], net=True, allow=["a.org"])
+                             caches=[self.cache], net=True, allow=["a.org"], observe=observed is not None)
         with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy), \
+                mock.patch.object(sys.modules["mvm.observer"], "Observer", FakeObserver), \
+                mock.patch.object(sys.modules["mvm.observer"], "image_present", return_value=True), \
                 mock.patch.object(sys.modules["mvm.runtime"], "run_podman", side_effect=fake), \
                 mock.patch.object(sys.modules["mvm.runtime"], "reap_orphans", return_value=[]):
             return self.mvm.execute(plan)
+
+    OK = {"allowed": {"a.org": {"connections": 1}}, "denied": {}}
+
+    def test_observed_clean_run_commits(self):
+        rc = self._net_run(self.OK, observed=({"flows": [{"sni": "a.org"}], "ja4": ["t13"], "outside_allowlist": []}, True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.img.read_bytes(), b"WRITTEN")
+        self.assertEqual(self.last_record()["observer"]["ja4"], ["t13"])
+
+    def test_dead_observer_fails_the_run(self):
+        """Fail closed: when the observer is on, a run it did not fully observe never commits."""
+        rc = self._net_run(self.OK, observed=({"flows": [], "ja4": [], "outside_allowlist": []}, False))
+        self.assertEqual(rc, self.mvm.EXIT_OBSERVER_FAILED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "observer-failed")
+
+    def test_unobserved_connection_fails_the_run(self):
+        """A proxy connection with no observed flow (capture missed it) is not trusted."""
+        two = {"allowed": {"a.org": {"connections": 2}}, "denied": {}}
+        rc = self._net_run(two, observed=({"flows": [{"sni": "a.org"}], "ja4": [], "outside_allowlist": []}, True))
+        self.assertEqual(rc, self.mvm.EXIT_OBSERVER_FAILED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["observer"]["unobserved_connections"], 1)
+        self.assertFalse(self.last_record()["observer"]["healthy"])
+
+    def test_sni_outside_allowlist_holds_the_run(self):
+        """Domain fronting: CONNECT to an allowed host, TLS SNI for another name."""
+        rc = self._net_run(self.OK, observed=({"flows": [{"sni": "evil.example"}], "ja4": [],
+                                               "outside_allowlist": ["evil.example"]}, True))
+        self.assertEqual(rc, self.mvm.EXIT_EGRESS_DENIED)
+        self.assertEqual(self.img.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self.last_record()["result"], "held")
+
+    def test_observer_on_without_image_refuses_before_touching_anything(self):
+        self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
+        self.mvm.LIB_DIR.mkdir(exist_ok=True)
+        (self.mvm.LIB_DIR / "smokescreen").write_text("")
+        plan = self.mvm.Plan(kind="fetch", eco="go", image="i", memory="1g", cmd=["x"], src=None, net=True,
+                             caches=[self.mvm.Cache("c9", "/c9", True, "16M")], observe=True)
+        with mock.patch.object(sys.modules["mvm.observer"], "image_present", return_value=False):
+            with self.assertRaises(self.mvm.MvmError) as e:
+                self.mvm.execute(plan)
+        self.assertIn("make observer", str(e.exception))
+        self.assertFalse(self.mvm.cache_img("c9").exists())
+        self.assertFalse((self.mvm.STATE_ROOT / "runs").exists())
 
     def test_denied_egress_holds_the_run(self):
         """Exit 0 is not enough: a run that tried a denied host is not committed."""
@@ -629,6 +757,72 @@ class RealTests(unittest.TestCase):
         self.assertIn("example.com", rec["egress"]["denied"])
         self.assertIn("proxy.golang.org", rec["egress"]["allowed"])
         self.assertIn("DENIED: example.com", r.stderr)
+
+    FRONT_GO = r"""package main
+
+import ("bufio"; "crypto/tls"; "fmt"; "net"; "net/http"; "os"; "strings")
+
+// CONNECT to an allowed host, then send a TLS ClientHello whose SNI is `sni`.
+func hello(sni string) {
+	px := strings.TrimPrefix(os.Getenv("HTTPS_PROXY"), "http://")
+	c, err := net.Dial("tcp", px)
+	if err != nil { fmt.Println("dial", err); return }
+	defer c.Close()
+	fmt.Fprintf(c, "CONNECT proxy.golang.org:443 HTTP/1.1\r\nHost: proxy.golang.org:443\r\n\r\n")
+	r, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil || r.StatusCode != 200 { fmt.Println("connect", err); return }
+	err = tls.Client(c, &tls.Config{ServerName: sni, InsecureSkipVerify: true}).Handshake()
+	fmt.Println("hello", sni, err == nil)
+}
+
+func main() { hello("proxy.golang.org"); hello("example.com") }
+"""
+
+    def test_observer_catches_domain_fronting(self):
+        """Proves: with the observer on, a TLS ClientHello whose SNI is outside the allowlist,
+        sent through a CONNECT the proxy allowed, holds the run (exit 3, nothing committed).
+        Negative control in the same run: the honest SNI is observed and not flagged.
+        Needs smokescreen, localhost/mvm-observer:1 (make observer) and internet."""
+        lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
+        if not (lib / "smokescreen").is_file():
+            self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        cfg = Path(self.tmp.name) / "obs.toml"
+        cfg.write_text("[observer]\nenabled = true\n")
+        self.env["MVM_CONFIG"] = str(cfg)
+        import base64
+        b64 = base64.b64encode(self.FRONT_GO.encode()).decode()
+        r = self.mvm("fetch", "go", "--", "sh", "-c",
+                     f"echo {b64} | base64 -d > /tmp/f.go && cd /tmp && GOCACHE=/tmp/gc go run f.go")
+        self.assertIn("hello proxy.golang.org", r.stdout, r.stderr)     # control: both hellos were sent
+        self.assertIn("hello example.com", r.stdout, r.stderr)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
+        self.assertEqual(rec["result"], "held")
+        self.assertEqual(rec["egress"]["denied"], {})                    # the proxy saw nothing wrong
+        self.assertTrue(rec["observer"]["healthy"])
+        self.assertEqual(rec["observer"]["discarded_bytes"], 0)
+        self.assertEqual(rec["observer"]["unobserved_connections"], 0)
+        self.assertEqual(rec["observer"]["outside_allowlist"], ["example.com"])
+        self.assertEqual(sorted({f["sni"] for f in rec["observer"]["flows"]}), ["example.com", "proxy.golang.org"])
+        self.assertTrue(all(f["ja4"] for f in rec["observer"]["flows"]))
+        self.assertIn("SNI OUTSIDE THE ALLOWLIST: example.com", r.stderr)
+
+    def test_observer_quiet_fetch_commits(self):
+        """Proves: with the observer on, a fetch that makes no connection still commits
+        (ndpiReader writes a flow file and a clean stats line even with no traffic)."""
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        cfg = Path(self.tmp.name) / "obs.toml"
+        cfg.write_text("[observer]\nenabled = true\n")
+        self.env["MVM_CONFIG"] = str(cfg)
+        r = self.mvm("fetch", "go", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
+        self.assertEqual(rec["observer"]["flows"], [])
+        self.assertTrue(rec["observer"]["healthy"])
+        self.assertEqual(rec["observer"]["discarded_bytes"], -1)     # no packets, no stats line
 
     def test_masks_hide_secrets(self):
         """Proves: .git and .env are hidden inside the VM and the project is read-only."""

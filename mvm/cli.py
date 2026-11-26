@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import core, egress
+from . import core, egress, observer
 from .cache import cache_img, cache_meta, run_copies, try_exclusive
 from .core import DEFAULT_MASK, MvmError, die, find_sbin, load_config, now_iso, pinned, pins_path, read_json, resolve_digest, say, write_json_atomic
 from .ecos import ECOS, Eco, eco_caches
@@ -84,7 +84,8 @@ def cmd_fetch(args: list[str]) -> int:
             plan = Plan(kind="fetch", eco=name, image=image_for(cfg, eco),
                         memory=memory_for(cfg, name, eco.memory), cmd=cmd, src=tree, src_rw=True,
                         net=True, caches=eco_caches(eco, "fetch", root), env={**eco.env, **eco.fetch_env},
-                        project=root, learn=learn, allow=egress.allowlist(cfg, name))
+                        project=root, learn=learn, allow=egress.allowlist(cfg, name),
+                        observe=observer.enabled(cfg))
             rc = execute(plan)
             if rc != 0:
                 return rc
@@ -106,6 +107,9 @@ def report_learned(eco: str, result: dict) -> None:
     refused = sorted(result.get("denied", {}))
     if refused:
         say(f"{eco}: refused even in learn mode (Smokescreen IP rules, cannot be allowed): {', '.join(refused)}")
+    sni = result.get("observer", {}).get("outside_allowlist", [])
+    if sni:
+        say(f"{eco}: TLS names (SNI) outside the allowlist: {', '.join(sni)}")
     if not extra:
         say(f"{eco}: no hosts outside the allowlist")
         return
@@ -191,8 +195,13 @@ def cmd_status(args: list[str]) -> int:
         print(f"egress   fetch only, through the allowlist proxy ({sb})")
     else:
         print(f"egress   MISSING proxy {sb}: fetch refuses to run (make smokescreen)")
-    print("observer off")
     cfg = load_config()
+    if not observer.enabled(cfg):
+        print("observer off")
+    elif observer.image_present():
+        print(f"observer on: nDPI flows (SNI, JA4, bytes) for every fetch ({observer.OBSERVER_IMAGE})")
+    else:
+        print(f"observer on but MISSING image {observer.OBSERVER_IMAGE}: fetch refuses to run (make observer)")
     for name in ECOS:
         print(f"  allow {name:<5} {', '.join(egress.allowlist(cfg, name))}")
     print("\nimages")

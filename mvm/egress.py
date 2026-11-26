@@ -32,6 +32,10 @@ FIREWALL_IMAGE = "localhost/mvm-egress-fw:1"
 # namespace gets a kernel egress filter: only TCP 443 out, plus DNS to its resolver.
 FIREWALL_SH = r"""set -eu
 NS=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+# pasta gives the pod MTU 65520; at that size a packet capture (the observer) drops the
+# oversized frames that carry the TLS ClientHello. 1500 keeps every frame parseable.
+IF=$(awk -F: 'NR>2 {gsub(/ /,"",$1); if ($1 != "lo") {print $1; exit}}' /proc/net/dev)
+ip link set dev "$IF" mtu 1500
 nft -f - <<NFT
 table inet mvm_egress {
   chain out {
@@ -39,6 +43,10 @@ table inet mvm_egress {
     oifname "lo" accept
     ct state established,related accept
     ip daddr $NS meta l4proto { tcp, udp } th dport 53 accept
+    # Defence in depth (Smokescreen refuses these too): never private, CGNAT/tailnet,
+    # link-local, loopback or multicast destinations, whatever a name resolves to.
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } reject
+    ip6 daddr { ::/127, fc00::/7, fe80::/10, ff00::/8 } reject
     tcp dport 443 accept
     meta l4proto tcp reject with tcp reset
     reject
@@ -46,6 +54,7 @@ table inet mvm_egress {
 }
 NFT
 nft list table inet mvm_egress | grep -q 'policy drop'
+echo "MVM_IF=$IF"
 echo MVM_EGRESS_FIREWALL_LOADED
 """
 PROXY_PORT_IN_CONTAINER = 4750
@@ -201,6 +210,7 @@ class Proxy:
         self._dir: tempfile.TemporaryDirectory | None = None
         self.summary: dict = {"allowed": {}, "denied": {}}
         self.healthy = False                  # proxy still running and its log readable at the end
+        self.iface = ""                       # the pod's capture interface (for the observer)
 
     def __enter__(self) -> Proxy:
         binary = smokescreen_bin()
@@ -236,6 +246,7 @@ class Proxy:
                             capture_output=True, text=True)
         if fw.returncode != 0 or "MVM_EGRESS_FIREWALL_LOADED" not in fw.stdout:
             raise core.MvmError(f"egress port filter failed to load: {(fw.stderr or fw.stdout).strip()[:300]}")
+        self.iface = next((ln[len("MVM_IF="):] for ln in fw.stdout.splitlines() if ln.startswith("MVM_IF=")), "")
         argv = ["podman", "run", "-d", "--pod", self.name, "--name", f"{self.name}-smokescreen", *labels,
                 "--read-only", "--cap-drop=all", "--security-opt", "no-new-privileges",
                 "-v", f"{binary}:/smokescreen:ro,z", "-v", f"{cfg}:/cfg:ro,z",

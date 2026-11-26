@@ -23,6 +23,7 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 - **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed.
 - **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
 - **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
+- **Observer (optional, off by default).** With `[observer] enabled = true`, a passive [nDPI](https://github.com/ntop/nDPI) `ndpiReader` sidecar in the proxy pod records every outbound TLS flow: SNI, JA4 and bytes, in the run record and summarised. A TLS name outside the allowlist (or no SNI) holds the run like a denial (exit 3): the proxy only sees the CONNECT host, so this catches domain fronting. It fails closed: a missing image refuses the fetch, a dead observer, unreadable flows, discarded frames, or a proxy connection with no observed flow means nothing is committed (exit 5). `mvm status` prints `observer off` when it is off.
 - **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.
 
 ## State
@@ -53,6 +54,9 @@ run = "1g"
 
 [allow]                # extra hosts for fetch, on top of the built-in registries
 go = ["github.com", "codeload.github.com"]
+
+[observer]             # nDPI flow observer for fetch (needs `make observer`); off by default
+enabled = true
 ```
 
 Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`; rust `index.crates.io`, `static.crates.io`; node `registry.npmjs.org`.
@@ -75,6 +79,7 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 sudo dnf install podman crun-krun e2fsprogs
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
+make observer       # optional: build the nDPI observer image (nDPI 6.0 tarball pinned by sha256)
 make test           # unit tests, no KVM needed
 make test-real      # + real microVM tests, including the egress escape test
 ```
@@ -83,6 +88,7 @@ make test-real      # + real microVM tests, including the egress escape test
 
 - podman's `--tmpfs` is ignored under krun; mvm hides directories with an empty read-only bind instead.
 - Ports: Smokescreen's ACL is host-only, so the proxy runs in a pod whose network namespace has an nftables egress filter (loaded by a one-shot `NET_ADMIN` container; Smokescreen itself has no capabilities): only TCP 443 out, plus DNS to the pod's resolver. An allowed host on any other port is refused, recorded as denied, and holds the run. Host loopback, link-local, private and CGNAT ranges and IP literals are refused by Smokescreen (checked with real CONNECT probes).
+- Observer: it captures only the pod's outbound leg (proxy to registry), which carries the VM's own ClientHello relayed through CONNECT; denied requests never reach the network, so for those the proxy log is the record. The firewall one-shot sets the pod's MTU to 1500 because pasta's 65520 makes `ndpiReader` drop the frames that carry the ClientHello. Cisco mercury was tried first and rejected: its AF_PACKET ring needs at least 32 MiB of locked memory, above the 8 MiB rootless default.
 - Writable caches are single-writer: concurrent builds of the same ecosystem wait on the lock.
 - A failing build (non-zero exit, including failing tests) discards that run's build-cache writes; the next run rebuilds.
 - Rust path dependencies outside the project directory and npm workspaces with nested `node_modules` are not handled by `fetch` yet.

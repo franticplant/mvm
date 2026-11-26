@@ -5,11 +5,15 @@ LIBDIR ?= $(PREFIX)/lib/mvm
 # at least two weeks old; built offline by mvm itself from its vendored sources.
 SMOKESCREEN_REV ?= 5b4b7aabca9bc70a8435358d648edd03294c299e
 SMOKESCREEN_SRC ?= $(HOME)/.cache/mvm-src/smokescreen
+# nDPI (ntop) for the optional observer: release tarball pinned by sha256.
+NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/6.0.tar.gz
+NDPI_SHA256 ?= 21fc40cab5505942c0b21d9bbaf73e9adf8162ddfe782e4cd072cab855a2eda9
+NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
 MANDIR ?= $(PREFIX)/share/man/man1
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test test-real lint smokescreen
+.PHONY: install uninstall test test-real lint smokescreen observer
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
@@ -53,3 +57,10 @@ smokescreen:
 	install -m 0755 "$(SMOKESCREEN_SRC)/out/smokescreen" "$(LIBDIR)/smokescreen"
 	podman build -q -t localhost/mvm-egress-fw:1 -f egress/Containerfile.firewall egress >/dev/null
 	@echo "Installed smokescreen $(SMOKESCREEN_REV) into $(LIBDIR) and built localhost/mvm-egress-fw:1"
+
+observer:
+	install -d "$(NDPI_SRC)"
+	@test -f "$(NDPI_SRC)/nDPI-6.0.tar.gz" || curl -fsSL -o "$(NDPI_SRC)/nDPI-6.0.tar.gz" "$(NDPI_URL)"
+	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-6.0.tar.gz" | sha256sum -c -
+	podman build -q -t localhost/mvm-observer:1 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
+	@echo "Built localhost/mvm-observer:1 (nDPI 6.0); enable it with [observer] enabled = true in ~/.config/mvm/config.toml"

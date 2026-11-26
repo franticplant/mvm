@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import core, egress
+from . import core, egress, observer
 from .cache import Locks, cache_img, commit_copy, ensure_cache, make_run_copy
 from .core import KEEP_RUNS, now_iso, podman_out, say, write_json_atomic
 from .ecos import Cache
@@ -37,6 +37,7 @@ class Plan:
     learn: bool = False       # fetch --learn: proxy reports instead of enforcing; never commits
     allow: list[str] = field(default_factory=list)      # egress allowlist for net runs
     egress_result: dict = field(default_factory=dict)   # filled by execute(): this run's egress summary
+    observe: bool = False     # net runs: nDPI observer sidecar in the proxy pod (fail closed)
 
 
 def new_run_id() -> str:
@@ -142,6 +143,9 @@ def execute(plan: Plan) -> int:
         # Fail closed before touching caches or writing a record.
         raise core.MvmError(f"egress proxy missing: {egress.smokescreen_bin()} (run `make smokescreen` "
                             "in the mvm repo); fetch refuses to run without it")
+    if plan.net and plan.observe and not observer.image_present():
+        raise core.MvmError(f"observer is enabled but its image is missing: {observer.OBSERVER_IMAGE} "
+                            "(run `make observer` in the mvm repo); fetch refuses to run without it")
     run_id = new_run_id()
     reap_orphans()
     project = plan.project
@@ -151,6 +155,7 @@ def execute(plan: Plan) -> int:
     rec = {"id": run_id, "kind": plan.kind, "eco": plan.eco, "image": plan.image,
            "cmd": plan.cmd, "cwd": str(project or Path.cwd()), "started_at": now_iso(),
            "egress": {"mode": mode, "allow": plan.allow if plan.net else []},
+           "observer": "on" if plan.net and plan.observe else "off",
            "caches": {c.name: ("rw" if c.rw else "ro") for c in plan.caches}}
     write_json_atomic(record_path(run_id), rec)
 
@@ -172,6 +177,8 @@ def execute(plan: Plan) -> int:
                         egress.Proxy(run_id, plan.allow, "report" if plan.learn else "enforce"))
                     plan.env = {**plan.env, **egress.proxy_env(px.port)}
                     net_args = egress.vm_network_args(px.port)
+                    if plan.observe:
+                        ob = stack.enter_context(observer.Observer(run_id, px.name, px.iface, plan.allow))
                 argv = podman_argv(plan, run_id, mounts, Path(empty), net_args)
                 try:
                     rc = run_podman(argv)
@@ -182,15 +189,33 @@ def execute(plan: Plan) -> int:
                 rec["egress"].update(px.summary, proxy_healthy=px.healthy)
                 plan.egress_result = rec["egress"]
                 say(f"{label}: {egress.summary_line(px.summary)}")
+                if plan.observe:
+                    missed = observer.unobserved(ob.summary, px.summary)
+                    if missed:
+                        ob.healthy = False
+                        say(f"{label}: the observer has no flow for {missed} connection(s) the proxy made")
+                    rec["observer"] = {**ob.summary, "healthy": ob.healthy, "unobserved_connections": missed,
+                                       "discarded_bytes": getattr(ob, "discarded", None)}
+                    plan.egress_result = {**rec["egress"], "observer": rec["observer"]}
+                    say(f"{label}: {observer.summary_line(ob.summary)}")
+            observed_ok = not (plan.net and plan.observe) or ob.healthy
+            sni_outside = plan.net and plan.observe and ob.summary["outside_allowlist"]
             if rc == 0 and plan.learn:
                 result = "learned"            # learning never changes caches
             elif rc == 0 and plan.net and not px.healthy:
                 result, rc = "proxy-failed", core.EXIT_PROXY_FAILED
                 say(f"{label}: the egress proxy died or its log was unreadable; nothing committed")
+            elif rc == 0 and not observed_ok:
+                result, rc = "observer-failed", core.EXIT_OBSERVER_FAILED
+                say(f"{label}: the observer died or its flows were unreadable; nothing committed")
             elif rc == 0 and plan.net and px.summary["denied"]:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
                 say(f"{label}: egress was denied, so this run is not trusted: nothing committed. "
                     "Check the hosts with `mvm fetch --learn` and allow them in [allow] if expected")
+            elif rc == 0 and sni_outside:
+                result, rc = "held", core.EXIT_EGRESS_DENIED
+                say(f"{label}: TLS went to a name outside the allowlist (SNI {', '.join(sni_outside)}) "
+                    "although the proxy was asked for an allowed host: nothing committed")
             elif rc == 0:
                 rec["generations"] = {n: commit_copy(n, cp, run_id) for n, cp in copies.items()}
                 copies.clear()
