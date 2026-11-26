@@ -89,7 +89,7 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 sudo dnf install podman crun-krun e2fsprogs
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
-make observer       # optional: build the nDPI observer image (nDPI 6.0 tarball pinned by sha256)
+make observer       # build the nDPI observer image (nDPI 6.0 pinned by sha256); on by default, fetch refuses without it
 make timer          # optional: daily `mvm check --all` as a systemd user timer
 make test           # unit tests, no KVM needed
 make test-real      # + real microVM tests, including the egress escape test
