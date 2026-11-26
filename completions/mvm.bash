@@ -13,11 +13,12 @@ _mvm_completion() {
         [[ "${COMP_WORDS[i]}" == "--" ]] && { mapfile -t COMPREPLY < <(compgen -f -- "$cur"); return; }
     done
     if ((COMP_CWORD == 1)); then
-        mapfile -t COMPREPLY < <(compgen -W "fetch build run status update cache" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "fetch build run check status update cache" -- "$cur")
         return
     fi
     case "${COMP_WORDS[1]}" in
         fetch) mapfile -t COMPREPLY < <(compgen -W "go rust node --learn --" -- "$cur") ;;
+        check) mapfile -t COMPREPLY < <(compgen -W "--all" -- "$cur") ;;
         build|run)
             case "$prev" in
                 -w) mapfile -t COMPREPLY < <(compgen -d -- "$cur") ;;

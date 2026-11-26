@@ -24,6 +24,9 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .B \-\-
 .IR CMD ...
 .br
+.B mvm check
+.RB [ \-\-all ]
+.br
 .B mvm status
 .br
 .B mvm update
@@ -40,7 +43,7 @@ with
 with no host privileges.
 .PP
 .B fetch
-is the only command with network. It mounts a throwaway copy of the
+is the only command that downloads (check reaches only api.osv.dev). It mounts a throwaway copy of the
 dependency manifests only (go.mod, go.sum, go.work, Cargo.toml, Cargo.lock,
 package.json, package\-lock.json; Cargo target files as empty stubs), never the
 sources. Without
@@ -77,6 +80,28 @@ observer fails closed: without its image
 .RB ( "make observer" )
 fetch refuses to run; a dead observer, discarded frames, or a proxy connection
 without an observed flow commits nothing (exit 5).
+.PP
+Before every fetch,
+.B osv\-scanner
+(Google, OSV.dev) checks the lockfiles (go.mod, Cargo.lock, package\-lock.json)
+in a microVM that sees only those files and reaches only api.osv.dev through
+the same allowlist proxy. A package with an OSV
+.B MAL\-
+advisory (OpenSSF malicious packages) refuses the fetch (exit 6); known
+vulnerabilities are printed and recorded but do not block. When a fetch
+command changed the lockfile, the new one is checked before anything is
+committed or copied back. A check that cannot complete refuses the fetch;
+.B [check] before_fetch = false
+turns the check off.
+.B mvm check
+runs the same check here,
+.B mvm check \-\-all
+for every project mvm has fetched or checked (the daily timer, see
+.BR "make timer" ).
+With
+.B [notify] ntfy
+set, trips (malicious packages, held runs, failed proxy or observer, failed
+checks) are posted there.
 .PP
 .B build
 runs offline in the current project, mounted read\-only at
@@ -144,10 +169,17 @@ Optional:
 .B [memory]
 (go, rust, node, run),
 .B [observer]
-(enabled = true|false, default false).
+(enabled = true|false, default false),
+.B [check]
+(before_fetch = true|false, default true),
+.B [notify]
+(ntfy = "https://ntfy.example/<topic>").
 .TP
 .I ~/.local/state/mvm/runs/
 One JSON record per run (last 200).
+.TP
+.I ~/.local/state/mvm/checks/
+Last check result per project.
 .SH ENVIRONMENT
 .BR MVM_CACHE_DIR ", " MVM_STATE_DIR ", " MVM_CONFIG
 override the paths above.
@@ -157,10 +189,14 @@ The command's exit status; 2 for usage errors; 130 when interrupted;
 nothing is committed or copied back); 4 when the egress proxy died mid\-run or
 its log could not be read (nothing committed); 5 when the observer was on and
 died mid\-run, its flows could not be read, it discarded frames, or it missed a
-connection the proxy made (nothing committed).
+connection the proxy made (nothing committed); 6 when a lockfile pins a package
+with an OSV MAL\- advisory (fetch refused or nothing committed;
+.B mvm check
+exits 6); 1 when a check could not complete.
 .SH EXAMPLES
 .nf
 mvm fetch
+mvm check \-\-all
 mvm fetch go \-\- go get golang.org/x/net@latest
 mvm fetch rust \-\- cargo generate\-lockfile
 mvm build \-w build \-\- go build \-o build/app ./cmd/app

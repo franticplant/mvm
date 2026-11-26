@@ -14,7 +14,8 @@ _mvm() {
     'fetch:download or change dependencies (only networked step)'
     'build:build offline against the fetched caches'
     'run:run any image offline'
-    'status:config, pinned images, caches, recent runs'
+    'check:osv-scanner on lockfiles (here or --all)'
+    'status:config, checks, trips, images, caches, runs'
     'update:re-pull and re-pin images'
     'cache:manage cache images'
   )
@@ -28,6 +29,7 @@ _mvm() {
   fi
   case "$words[2]" in
     fetch) _arguments '--learn[allow but log every host, commit nothing]' '1::ecosystem:(go rust node)' ;;
+    check) _arguments '--all[every project mvm knows]' ;;
     build) _arguments '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' '1::ecosystem:(go rust node)' ;;
     run)   _arguments '-i[image]:image:' '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' ;;
     cache)

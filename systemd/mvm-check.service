@@ -1,0 +1,9 @@
+[Unit]
+Description=mvm: osv-scanner check of every project mvm knows (lockfiles only)
+Documentation=man:mvm(1)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mvm check --all
+# Each project's lockfiles are scanned in a krun microVM that reaches only api.osv.dev.
+Nice=10

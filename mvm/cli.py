@@ -5,9 +5,10 @@ from __future__ import annotations
 import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
-from . import core, egress, observer
+from . import check, core, egress, observer
 from .cache import cache_img, cache_meta, run_copies, try_exclusive
 from .core import DEFAULT_MASK, MvmError, die, find_sbin, load_config, now_iso, pinned, pins_path, read_json, resolve_digest, say, write_json_atomic
 from .ecos import ECOS, Eco, eco_caches
@@ -71,8 +72,13 @@ def cmd_fetch(args: list[str]) -> int:
     cfg = load_config()
     if learn:
         say("learn mode: egress is allowed but logged, nothing is committed or copied back")
+    checking = check.before_fetch(cfg)
     for name in ecos:
         eco = ECOS[name]
+        if checking:
+            rc = pre_check(root, name, cfg)
+            if rc:
+                return rc
         with tempfile.TemporaryDirectory(prefix=f"mvm-fetch-{name}-") as tmp:
             tree = Path(tmp)
             manifest_tree(root, eco, tree)
@@ -85,7 +91,11 @@ def cmd_fetch(args: list[str]) -> int:
                         memory=memory_for(cfg, name, eco.memory), cmd=cmd, src=tree, src_rw=True,
                         net=True, caches=eco_caches(eco, "fetch", root), env={**eco.env, **eco.fetch_env},
                         project=root, learn=learn, allow=egress.allowlist(cfg, name),
-                        observe=observer.enabled(cfg))
+                        observe=observer.enabled(cfg), notify=check.notify_url(cfg))
+            # Every non-learn fetch: a plain `cargo fetch` without Cargo.lock writes a new one.
+            # post_check costs nothing (no VM) when no lockfile changed.
+            if checking and not learn:
+                plan.gate = lambda tree=tree, name=name: post_check(root, tree, name, cfg)
             rc = execute(plan)
             if rc != 0:
                 return rc
@@ -99,6 +109,64 @@ def cmd_fetch(args: list[str]) -> int:
     if "node" in ecos:
         say("node: install scripts were skipped; run them offline: mvm build node -- npm rebuild")
     return 0
+
+
+def pre_check(root: Path, eco: str, cfg: dict) -> int:
+    """osv-scanner on the project's lockfile before any download; a malicious package stops it."""
+    s = check.scan_project(root, eco, cfg)
+    check.record(root, eco, s)
+    say(f"{eco}: {check.summary_line(s)}")
+    if s["malicious"]:
+        names = ", ".join(f"{m['package']}@{m['version']}" for m in s["malicious"])
+        check.notify(check.notify_url(cfg), f"mvm fetch {eco}: malicious dependency",
+                     f"{root.name}: {names}; fetch refused")
+        say(f"{eco}: refusing to fetch: the lockfile pins a known malicious package ({names})")
+        return core.EXIT_MALICIOUS
+    return 0
+
+
+def post_check(root: Path, tree: Path, eco: str, cfg: dict) -> str:
+    """After a fetch whose command changed the lockfile, before its caches are committed."""
+    names = set(check.LOCKFILES[eco])
+    if not any(Path(rel).name in names for rel in changed_manifests(root, tree, ECOS[eco])):
+        return ""
+    s = check.scan_tree(tree, eco, cfg, root)
+    say(f"{eco}: new lockfile {check.summary_line(s)}")
+    if not s["malicious"]:
+        return ""
+    return "the new lockfile pins a known malicious package (" + ", ".join(
+        f"{m['package']}@{m['version']}" for m in s["malicious"]) + ")"
+
+
+def cmd_check(args: list[str]) -> int:
+    """osv-scanner on lockfiles: this project, or with --all every project mvm knows."""
+    if args not in ([], ["--all"]):
+        die("usage: mvm check [--all]")
+    cfg = load_config()
+    roots = check.known_projects() if args else [Path.cwd().resolve()]
+    if not roots:
+        say("no projects known yet (mvm fetch or mvm check in a project first)")
+        return 0
+    worst, trips = 0, []
+    for root in roots:
+        for eco in detect_ecos(root):
+            try:
+                s = check.scan_project(root, eco, cfg)
+            except MvmError as e:
+                say(f"{root}: {eco}: {e}")
+                trips.append(f"{root.name} {eco}: check failed")
+                worst = max(worst, 1)
+                continue
+            check.record(root, eco, s)
+            print(f"{root}  {eco}: {check.summary_line(s)}")
+            if s["malicious"]:
+                trips.append(f"{root.name} {eco}: malicious " + ", ".join(
+                    f"{m['package']}@{m['version']}" for m in s["malicious"]))
+                worst = core.EXIT_MALICIOUS
+    if trips:
+        check.notify(check.notify_url(cfg), "mvm check: " + ("malicious dependency" if worst == core.EXIT_MALICIOUS
+                                                            else "check failed"), "\n".join(trips))
+    return worst
 
 
 def report_learned(eco: str, result: dict) -> None:
@@ -204,6 +272,26 @@ def cmd_status(args: list[str]) -> int:
         print(f"observer on but MISSING image {observer.OBSERVER_IMAGE}: fetch refuses to run (make observer)")
     for name in ECOS:
         print(f"  allow {name:<5} {', '.join(egress.allowlist(cfg, name))}")
+    print(f"check    {'before every fetch' if check.before_fetch(cfg) else 'OFF before fetch'}"
+          f" (osv-scanner {check.OSV_IMAGE.rsplit(':', 1)[1]}, MAL- advisories block)")
+    print(f"notify   {'ntfy on trips' if check.notify_url(cfg) else 'off'}")
+    print("\nchecks")
+    recs = [read_json(x, {}) for x in sorted(check.checks_dir().glob("*.json"))]
+    for r in sorted(recs, key=lambda r: r.get("checked_at", "")):
+        for eco, c in sorted(r.get("ecos", {}).items()):
+            mal, vul = len(c.get("malicious", [])), len(c.get("vulnerable", []))
+            state = "skipped" if c.get("skipped") else f"{'MALICIOUS ' + str(mal) if mal else 'ok'}, {vul} vulnerable"
+            print(f"  {c.get('checked_at', '-'):<20} {eco:<4} {state:<24} {r.get('project', '?')}")
+    if not recs:
+        print("  (none yet: mvm check)")
+    print("\ntrips (last 24h)")
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    trips = [r for r in (read_json(x, {}) for x in sorted((core.STATE_ROOT / "runs").glob("*.json")))
+             if r.get("result") in check.TRIP_RESULTS and r.get("started_at", "") >= cutoff]
+    for r in trips:
+        print(f"  {r.get('started_at')}  {r.get('kind')} {r.get('eco') or '-'}  {r['result']}  exit {r.get('exit')}  {r.get('cwd')}")
+    if not trips:
+        print("  (none)")
     print("\nimages")
     pins = read_json(pins_path(), {})
     for tag in sorted(pins):
@@ -316,15 +404,17 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
                                        build offline against the fetched caches
   mvm run -i IMAGE [-w DIR] [--it] -- CMD
                                        run any image offline
-  mvm status                           config, pinned images, caches, recent runs
+  mvm check [--all]                    osv-scanner on the lockfiles (here, or every
+                                       known project); also runs before every fetch
+  mvm status                           config, checks, trips, pinned images, caches, runs
   mvm update                           re-pull and re-pin images
   mvm cache rm NAME | grow NAME SIZE | gc
 
   -w DIR   make ./DIR writable (the project is read-only otherwise)
   --it     interactive terminal
 
-fetch is the only command with network, and its only way out is a per-run
-allowlist proxy (Smokescreen): no DNS, no direct connections. It sees only the dependency manifests
+fetch is the only command that downloads (check reaches only api.osv.dev), and the way
+out is a per-run allowlist proxy (Smokescreen): no DNS, no direct connections. It sees only the dependency manifests
 (go.mod, Cargo.toml, package.json and their lockfiles), never your sources, and
 only changed manifests are copied back. npm install scripts are skipped by
 default (run them offline: mvm build node -- npm rebuild).
@@ -350,7 +440,7 @@ def main(argv: list[str]) -> int:
         print(USAGE, end="")
         return 0
     signal.signal(signal.SIGTERM, _sigterm)
-    cmds = {"fetch": cmd_fetch, "build": cmd_build, "run": cmd_run, "status": cmd_status,
+    cmds = {"fetch": cmd_fetch, "build": cmd_build, "run": cmd_run, "status": cmd_status, "check": cmd_check,
             "update": cmd_update, "cache": cmd_cache}
     fn = cmds.get(argv[0])
     if fn is None:

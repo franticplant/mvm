@@ -9,10 +9,11 @@ import shlex
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import core, egress, observer
+from . import check, core, egress, observer
 from .cache import Locks, cache_img, commit_copy, ensure_cache, make_run_copy
 from .core import KEEP_RUNS, now_iso, podman_out, say, write_json_atomic
 from .ecos import Cache
@@ -38,6 +39,9 @@ class Plan:
     allow: list[str] = field(default_factory=list)      # egress allowlist for net runs
     egress_result: dict = field(default_factory=dict)   # filled by execute(): this run's egress summary
     observe: bool = False     # net runs: nDPI observer sidecar in the proxy pod (fail closed)
+    ok_exit: tuple[int, ...] = (0,)   # exit codes that count as clean (osv-scanner: 1 = findings)
+    gate: Callable[[], str] | None = None   # runs before commit; a non-empty reason refuses it
+    notify: str = ""          # ntfy URL: post when the run trips (held, failed proxy/observer, malicious)
 
 
 def new_run_id() -> str:
@@ -200,28 +204,36 @@ def execute(plan: Plan) -> int:
                     say(f"{label}: {observer.summary_line(ob.summary)}")
             observed_ok = not (plan.net and plan.observe) or ob.healthy
             sni_outside = plan.net and plan.observe and ob.summary["outside_allowlist"]
-            if rc == 0 and plan.learn:
+            clean = rc in plan.ok_exit
+            if clean and plan.learn:
                 result = "learned"            # learning never changes caches
-            elif rc == 0 and plan.net and not px.healthy:
+            elif clean and plan.net and not px.healthy:
                 result, rc = "proxy-failed", core.EXIT_PROXY_FAILED
                 say(f"{label}: the egress proxy died or its log was unreadable; nothing committed")
-            elif rc == 0 and not observed_ok:
+            elif clean and not observed_ok:
                 result, rc = "observer-failed", core.EXIT_OBSERVER_FAILED
                 say(f"{label}: the observer died or its flows were unreadable; nothing committed")
-            elif rc == 0 and plan.net and px.summary["denied"]:
+            elif clean and plan.net and px.summary["denied"]:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
                 say(f"{label}: egress was denied, so this run is not trusted: nothing committed. "
                     "Check the hosts with `mvm fetch --learn` and allow them in [allow] if expected")
-            elif rc == 0 and sni_outside:
+            elif clean and sni_outside:
                 result, rc = "held", core.EXIT_EGRESS_DENIED
                 say(f"{label}: TLS went to a name outside the allowlist (SNI {', '.join(sni_outside)}) "
                     "although the proxy was asked for an allowed host: nothing committed")
-            elif rc == 0:
+            elif clean and plan.gate and (reason := plan.gate()):
+                result, rc = "malicious", core.EXIT_MALICIOUS
+                rec["gate"] = reason
+                say(f"{label}: {reason}: nothing committed or copied back")
+            elif clean:
                 rec["generations"] = {n: commit_copy(n, cp, run_id) for n, cp in copies.items()}
                 copies.clear()
                 result = "committed" if rec["generations"] else "ok"
             else:
                 result = "failed"
+    except core.MvmError:
+        result, rc = "error", 1               # setup failed (proxy, observer, gate): not an interrupt
+        raise
     finally:
         for copy in copies.values():          # anything not committed is discarded
             copy.unlink(missing_ok=True)
@@ -233,4 +245,7 @@ def execute(plan: Plan) -> int:
             say(f"{label}: committed {gens} (run {run_id})")
         elif copies:
             say(f"{label}: {result}, exit {rc}, cache writes discarded (run {run_id})")
+        if result in check.TRIP_RESULTS and plan.notify:
+            check.notify(plan.notify, f"mvm {label}: {result}",
+                         f"{label} in {Path(rec['cwd']).name}: {result}, exit {rc} (run {run_id})")
     return rc
