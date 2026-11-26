@@ -284,12 +284,51 @@ class PullTests(Base):
         with self.assertRaises(self.mvm.MvmError):
             self.mvm.pull.confined_pull("localhost/mvm-skopeo:1", {})
 
+    def layout(self, manifest: dict | None = None) -> Path:
+        img = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        blobs = {}
+        for data in (b"config", b"layer"):
+            h = hashlib.sha256(data).hexdigest()
+            (img / h).write_bytes(data)
+            blobs[data] = h
+        m = manifest or {"schemaVersion": 2, "config": {"digest": "sha256:" + blobs[b"config"]},
+                         "layers": [{"digest": "sha256:" + blobs[b"layer"]}]}
+        (img / "manifest.json").write_bytes(json.dumps(m).encode())
+        (img / "version").write_text("Directory Transport Version: 1.1\n")
+        return img
+
     def test_digest_is_of_the_manifest_bytes(self):
-        img = Path(self.tmp.name) / "img"
-        img.mkdir()
-        (img / "manifest.json").write_bytes(b'{"schemaVersion":2}')
+        img = self.layout()
         self.assertEqual(self.mvm.pull.manifest_digest(img),
-                         "sha256:" + hashlib.sha256(b'{"schemaVersion":2}').hexdigest())
+                         "sha256:" + hashlib.sha256((img / "manifest.json").read_bytes()).hexdigest())
+
+    def test_hostile_layouts_are_refused_before_the_host_loads_them(self):
+        """The VM writes the dir: layout; agy review: symlinks, indexes, foreign URLs, missing blobs."""
+        cfg, lay = hashlib.sha256(b"config").hexdigest(), hashlib.sha256(b"layer").hexdigest()
+        cases = {
+            "symlinked manifest": lambda img: ((img / "manifest.json").unlink(),
+                                               (img / "manifest.json").symlink_to("/etc/passwd")),
+            "symlinked blob": lambda img: ((img / lay).unlink(), (img / lay).symlink_to("/etc/passwd")),
+            "subdirectory": lambda img: (img / "sub").mkdir(),
+            "stray file": lambda img: (img / "notes.txt").write_text("x"),
+            "index": lambda img: (img / "manifest.json").write_text('{"manifests": [], "layers": []}'),
+            "foreign urls": lambda img: (img / "manifest.json").write_text(json.dumps(
+                {"config": {"digest": "sha256:" + cfg},
+                 "layers": [{"digest": "sha256:" + lay, "urls": ["https://evil.example/l"]}]})),
+            "missing blob": lambda img: (img / lay).unlink(),
+            "bad digest": lambda img: (img / "manifest.json").write_text(json.dumps(
+                {"config": {"digest": "sha256:" + cfg}, "layers": [{"digest": "sha256:../../x"}]})),
+            "not json": lambda img: (img / "manifest.json").write_text("{"),
+        }
+        for name, spoil in cases.items():
+            img = self.layout()
+            spoil(img)
+            with self.assertRaises(self.mvm.MvmError, msg=name):
+                self.mvm.pull.manifest_digest(img)
+        link = Path(self.tmp.name) / "imglink"
+        link.symlink_to(self.layout())
+        with self.assertRaises(self.mvm.MvmError):
+            self.mvm.pull.manifest_digest(link)
 
     def test_missing_pinned_image_is_refused_not_pulled(self):
         self.mvm.write_json_atomic(self.mvm.pins_path(), {"docker.io/x/y:1": {"ref": "docker.io/x/y@sha256:ab"}})

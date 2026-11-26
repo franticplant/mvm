@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -57,8 +60,52 @@ def copy_argv(ref: str) -> list[str]:
             f"docker://{ref}", "dir:/out/img"]
 
 
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def manifest_digest(img: Path) -> str:
-    return "sha256:" + hashlib.sha256((img / "manifest.json").read_bytes()).hexdigest()
+    return "sha256:" + hashlib.sha256(checked_layout(img)).hexdigest()
+
+
+def checked_layout(img: Path) -> bytes:
+    """The VM wrote img: before the host reads it, require a flat dir of regular files
+    (no symlinks), one image manifest (no index) whose config and layers are all local
+    sha256 blobs with no foreign URLs, so `podman pull dir:` stays offline. Returns the
+    manifest bytes (read without following links)."""
+    def bad(why: str) -> core.MvmError:
+        return core.MvmError(f"downloaded image refused: {why}")
+    st = os.lstat(img)
+    if not stat.S_ISDIR(st.st_mode):
+        raise bad("not a directory")
+    names = set()
+    for e in os.scandir(img):
+        if not e.is_file(follow_symlinks=False):
+            raise bad(f"{e.name} is not a regular file")
+        if e.name not in ("manifest.json", "version") and not HEX64.fullmatch(e.name):
+            raise bad(f"unexpected file {e.name}")
+        names.add(e.name)
+    fd = os.open(img / "manifest.json", os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(4 * 1024 * 1024 + 1)
+    if len(raw) > 4 * 1024 * 1024:
+        raise bad("manifest too large")
+    try:
+        m = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise bad("manifest is not JSON") from None
+    if not isinstance(m, dict) or "manifests" in m or not isinstance(m.get("layers"), list):
+        raise bad("not a single image manifest")
+    for d in [m.get("config"), *m["layers"]]:
+        if not isinstance(d, dict):
+            raise bad("malformed descriptor")
+        dg, mt = d.get("digest"), str(d.get("mediaType", ""))
+        if not isinstance(dg, str) or not dg.startswith("sha256:") or not HEX64.fullmatch(dg[7:]):
+            raise bad(f"digest {dg!r}")
+        if d.get("urls") or "foreign" in mt or "nondistributable" in mt:
+            raise bad(f"foreign layer {dg}")
+        if dg[7:] not in names:
+            raise bad(f"blob {dg} missing")
+    return raw
 
 
 def confined_pull(ref: str, cfg: dict | None = None) -> str:
@@ -79,8 +126,9 @@ def confined_pull(ref: str, cfg: dict | None = None) -> str:
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="pull-", dir=base))
     try:
-        (work / "tmp").mkdir()
-        (work / "img").mkdir()
+        # Only out/ is writable in the VM; ca.crt and policy.json sit outside it.
+        (work / "out" / "tmp").mkdir(parents=True)
+        (work / "out" / "img").mkdir()
         (work / "policy.json").write_text(json.dumps(POLICY))
         # Copied fresh per pull: the host file is labelled cert_t, and relabelling a
         # system file (:z) is not an option.
@@ -89,7 +137,7 @@ def confined_pull(ref: str, cfg: dict | None = None) -> str:
                     src=None, net=True, allow=egress.allowlist(cfg, "pull"), observe=observer.enabled(cfg),
                     env={"TMPDIR": "/out/tmp", "HOME": "/out/tmp", "SSL_CERT_FILE": "/etc/mvm/ca.crt"},
                     volumes=[f"{work / 'ca.crt'}:/etc/mvm/ca.crt:ro,z",
-                             f"{work / 'policy.json'}:/etc/mvm/policy.json:ro,z", f"{work}:/out:z"],
+                             f"{work / 'policy.json'}:/etc/mvm/policy.json:ro,z", f"{work / 'out'}:/out:z"],
                     notify=cfg.get("notify", {}).get("ntfy", ""), quiet=True)
         rc = execute(plan)
         if rc != 0:
@@ -103,7 +151,7 @@ def confined_pull(ref: str, cfg: dict | None = None) -> str:
             err.egress = plan.egress_result         # for the [allow] suggestion
             err.rc = rc
             raise err
-        img = work / "img"
+        img = work / "out" / "img"
         digest = manifest_digest(img)
         if want and digest != want:
             raise core.MvmError(f"pull {ref}: got manifest {digest}; give the digest of the image for "
