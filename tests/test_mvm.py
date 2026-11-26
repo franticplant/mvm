@@ -1076,6 +1076,74 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         self.assertTrue(rec["observer"]["healthy"])
         self.assertEqual(rec["observer"]["discarded_bytes"], -1)     # no packets, no stats line
 
+    PLAIN_GO = r"""package main
+
+import ("bufio"; "crypto/tls"; "fmt"; "net"; "net/http"; "os"; "strings")
+
+// CONNECT proxy.golang.org:443, then either a real TLS handshake or plaintext HTTP.
+func tunnel(plain bool) {
+	px := strings.TrimPrefix(os.Getenv("HTTPS_PROXY"), "http://")
+	c, err := net.Dial("tcp", px)
+	if err != nil { fmt.Println("dial", err); return }
+	defer c.Close()
+	fmt.Fprintf(c, "CONNECT proxy.golang.org:443 HTTP/1.1\r\nHost: proxy.golang.org:443\r\n\r\n")
+	br := bufio.NewReader(c)
+	r, err := http.ReadResponse(br, nil)
+	if err != nil || r.StatusCode != 200 { fmt.Println("connect", err); return }
+	if !plain {
+		err = tls.Client(c, &tls.Config{ServerName: "proxy.golang.org"}).Handshake()
+		fmt.Println("tls", err == nil)
+		return
+	}
+	fmt.Fprintf(c, "GET / HTTP/1.0\r\nHost: proxy.golang.org\r\n\r\n")
+	line, _ := br.ReadString('\n')
+	fmt.Println("plain", strings.TrimSpace(line))
+}
+
+func main() { tunnel(false); tunnel(true) }
+"""
+
+    def test_observer_holds_plaintext_on_443(self):
+        """Proves: plaintext HTTP sent through a CONNECT to an allowed host:443 (nDPI sees
+        proto HTTP with that Host, no TLS, so no SNI was checked) holds the run (exit 3).
+        Control in the same run: real TLS to the same host is observed and not flagged."""
+        lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
+        if not (lib / "smokescreen").is_file():
+            self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        cfg = Path(self.tmp.name) / "obs.toml"
+        cfg.write_text("[observer]\nenabled = true\n")
+        self.env["MVM_CONFIG"] = str(cfg)
+        import base64
+        b64 = base64.b64encode(self.PLAIN_GO.encode()).decode()
+        r = self.mvm("fetch", "go", "--", "sh", "-c",
+                     f"echo {b64} | base64 -d > /tmp/p.go && cd /tmp && GOCACHE=/tmp/gc go run p.go")
+        self.assertIn("tls true", r.stdout, r.stderr)                   # control: real TLS
+        self.assertIn("plain", r.stdout, r.stderr)    # sent (Google closes plaintext on 443 unanswered)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        rec = json.loads(sorted((Path(self.env["MVM_STATE_DIR"]) / "runs").glob("*.json"))[-1].read_text())
+        self.assertEqual(rec["result"], "held")
+        self.assertEqual(rec["egress"]["denied"], {})                    # the proxy saw nothing wrong
+        self.assertTrue(rec["observer"]["healthy"])
+        self.assertEqual(rec["observer"]["outside_allowlist"], ["(non-tls:HTTP)"])
+        self.assertEqual(sorted(f["proto"] for f in rec["observer"]["flows"]), ["HTTP", "TLS"])
+
+    def test_fresh_npm_repo_fetches(self):
+        """Proves: a fresh `npm init` repo (lockfile with 0 packages; osv-scanner exits 128)
+        passes the check before and after a plain fetch and commits (exit 0)."""
+        lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
+        if not (lib / "smokescreen").is_file():
+            self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
+        (self.proj / "go.mod").unlink()
+        (self.proj / "package.json").write_text('{"name":"p","version":"1.0.0"}')
+        (self.proj / "package-lock.json").write_text(json.dumps(
+            {"name": "p", "version": "1.0.0", "lockfileVersion": 3, "requires": True,
+             "packages": {"": {"name": "p", "version": "1.0.0"}}}))
+        r = self.mvm("fetch")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 package(s)", r.stdout + r.stderr)
+
     def test_check_blocks_malicious_lockfile(self):
         """Proves: osv-scanner in a krun VM (only api.osv.dev reachable) flags a real MAL-
         advisory; mvm check exits 6 and fetch refuses before creating any cache. Control:
