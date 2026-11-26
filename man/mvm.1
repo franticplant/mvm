@@ -74,7 +74,11 @@ host\-loopback port, where a per\-run Smokescreen proxy (in a pod whose
 kernel egress filter allows only TCP 443) allows only the
 ecosystem's registries (plus
 .B [allow]
-from the config); DNS, other TCP, UDP, ICMP and IPv6 are closed. Each
+from the config); DNS, other TCP, UDP, ICMP and IPv6 are closed. The VM runs in
+its own pod, sealed by a one\-shot nftables container before it starts: output only
+on the pod's loopback (pasta's one forwarded port), everything else rejected, so no
+host service on any host address (tailnet, bridges) is reachable either. Pull,
+check and image build use the same sealed pod. Each
 connection and denial is logged in the run record and summarised.
 .B \-\-learn
 lets every host through but logs it, commits nothing, and prints the hosts

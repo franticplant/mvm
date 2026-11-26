@@ -44,7 +44,8 @@ The networked steps are `fetch`, `check`, `pull`/`update` and `image build`, eac
 ### Egress: allowlist proxy, held on denial
 
 - A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries.
-- No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs).
+- The VM runs in its own pod, sealed before it starts by a one-shot NET_ADMIN container (`mvm_vm_seal`): output is allowed only on the pod's loopback, where pasta's one forwarded port is; everything else is rejected. pasta alone is not enough: its outbound sockets are bound to 127.0.0.1, and Linux lets such a socket reach every *local* address, so without the seal a guest could reach host services listening on 0.0.0.0 through the tailnet or a bridge address (mvm 0.1.0 had this hole). The same sealed pod carries pull, check and image build (`podman build --network=ns:` that pod).
+- No DNS, no direct connections, no host services on any host address, no UDP, ICMP or IPv6 (each proven with real krun runs, including a host listener on 0.0.0.0 probed through every host address).
 - Every connection is logged with bytes in/out; denials are printed and kept in the run record.
 - **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
 - **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.

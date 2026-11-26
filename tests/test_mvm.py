@@ -6,6 +6,7 @@ and run only with MVM_REAL=1; each takes a few seconds.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -16,6 +17,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -23,6 +25,15 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "bin" / "mvm"
+
+
+class FakeVMPod:
+    """Unit tests never create pods: the VM pod's seal is proven by RealTests."""
+    def __init__(self, *a): self.name = "mvm-vm-fake"
+    def __enter__(self): return self
+    def __exit__(self, *e): return False
+    def run_args(self): return ["--pod", self.name]
+    def build_args(self): return ["--dns=none", "--network=ns:/proc/0/ns/net"]
 
 
 class _Facade:
@@ -343,11 +354,22 @@ class PodmanArgvTests(Base):
         plan = self.plan(kind="fetch", net=True)
         with self.assertRaises(self.mvm.MvmError):          # no unconfined network exists
             self.mvm.podman_argv(plan, "RID", {}, Path("/e"))
-        net = self.mvm.vm_network_args(4321)
-        argv = self.mvm.podman_argv(plan, "RID", {}, Path("/e"), net)
+        argv = self.mvm.podman_argv(plan, "RID", {}, Path("/e"), ["--pod", "mvm-vm-RID"])
         self.assertNotIn("--network=none", argv)
-        self.assertIn("--dns=none", argv)
-        self.assertIn("--network=pasta:-4,-o,127.0.0.1,--no-map-gw,-T,4321,--dns-host,192.0.2.1", argv)
+        self.assertEqual(argv[argv.index("--pod") + 1], "mvm-vm-RID")
+        pod = self.mvm.vm_pod_argv("mvm-vm-RID", 4321, [])
+        self.assertIn("--dns=none", pod)
+        self.assertIn("--network=pasta:-4,-o,127.0.0.1,--no-map-gw,-T,4321,--dns-host,192.0.2.1", pod)
+
+    def test_vm_pod_is_sealed_to_its_loopback(self):
+        sh = self.mvm.VM_SEAL_SH
+        self.assertIn("policy drop;", sh)
+        rules = [ln.strip() for ln in sh.splitlines() if ln.startswith("    ") and "chain" not in ln and "type" not in ln]
+        self.assertEqual(rules, ['oifname "lo" accept', "meta l4proto tcp reject with tcp reset", "reject"])
+        vp = self.mvm.VMPod("R", 1)
+        vp.netns = "/proc/42/ns/net"
+        self.assertEqual(vp.run_args(), ["--pod", "mvm-vm-R"])
+        self.assertEqual(vp.build_args(), ["--dns=none", "--network=ns:/proc/42/ns/net"])
 
 
 class PullTests(Base):
@@ -535,7 +557,7 @@ class ImageBuildTests(Base):
             ib.pin_from("FROM \\\n  docker.io/library/alpine:3.24\n", {})
 
     def test_build_argv_is_krun_confined_and_offline_for_images(self):
-        net = self.mvm.vm_network_args(4321)
+        net = ["--dns=none", "--network=ns:/proc/42/ns/net"]     # VMPod.build_args(): the sealed pod
         argv = self.mvm.imagebuild.build_argv("localhost/mvm-build-tmp:ab", Path("/ctx"), "2g", net, 4321)
         self.assertEqual(argv[:4], ["podman", "--runtime", "krun", "build"])   # RUN steps in KVM
         for flag in ("--pull=never", "--no-cache", "--layers=false", "--dns=none", *net):
@@ -554,7 +576,7 @@ class ImageBuildTests(Base):
         seen, calls = {}, []
 
         def fake_execute(plan):
-            argv = plan.argv_fn(self.mvm.vm_network_args(1), 1)
+            argv = plan.argv_fn(["--dns=none", "--network=ns:/proc/42/ns/net"], 1)
             ctx = Path(argv[-1])
             seen["files"] = sorted(p.name for p in ctx.iterdir())
             seen["cf"] = (ctx / "Containerfile").read_text()
@@ -1279,7 +1301,8 @@ class CommitTests(Base):
         self.mvm.LIB_DIR = Path(self.tmp.name) / "lib"
         self.mvm.LIB_DIR.mkdir()
         (self.mvm.LIB_DIR / "smokescreen").write_text("")       # present; the proxy itself is faked
-        with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy):
+        with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy), \
+                mock.patch.object(sys.modules["mvm.egress"], "VMPod", FakeVMPod):
             def fake(argv, *_a, **_k):
                 src = next(a for a in argv if a.endswith(":/run/mvm-imgs/0-c1.img:z")).split(":")[0]
                 Path(src).write_bytes(b"LEARNED")
@@ -1316,6 +1339,7 @@ class CommitTests(Base):
         plan = self.mvm.Plan(kind="fetch", eco="go", image="i", memory="1g", cmd=["x"], src=None,
                              caches=[self.cache], net=True, allow=["a.org"], observe=observed is not None)
         with mock.patch.object(sys.modules["mvm.egress"], "Proxy", FakeProxy), \
+                mock.patch.object(sys.modules["mvm.egress"], "VMPod", FakeVMPod), \
                 mock.patch.object(sys.modules["mvm.observer"], "Observer", FakeObserver), \
                 mock.patch.object(sys.modules["mvm.observer"], "image_present", return_value=True), \
                 mock.patch.object(sys.modules["mvm.runtime"], "run_podman", side_effect=fake), \
@@ -1476,6 +1500,40 @@ class RealTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=self.proj, env=self.env,
                               capture_output=True, text=True, timeout=120, **kw)
 
+    @contextlib.contextmanager
+    def trap(self):
+        """A host listener on 0.0.0.0 (every address): yields (port, host IPv4 addresses,
+        accepted connections). Nothing in a microVM may ever reach it."""
+        lst = socket.socket()
+        lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lst.bind(("0.0.0.0", 0))  # noqa: S104 - the trap: a host listener on every address
+        lst.listen(16)
+        lst.settimeout(0.2)
+        hits, stop = [], threading.Event()
+
+        def accept():
+            while not stop.is_set():
+                try:
+                    hits.append(lst.accept()[1])
+                except OSError:
+                    pass
+        t = threading.Thread(target=accept, daemon=True)
+        t.start()
+        addrs = sorted({ln.split()[3].split("/")[0] for ln in subprocess.run(
+            ["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout.splitlines()})
+        try:
+            yield lst.getsockname()[1], addrs, hits
+        finally:
+            stop.set()
+            t.join(2)
+            lst.close()
+
+    @staticmethod
+    def trap_probe(port, addrs):
+        """Shell: try every host address on the trap port; print TRAP_OPEN for any that connects."""
+        return (f"for a in {' '.join(addrs)}; do nc -w 3 $a {port} </dev/null >/dev/null 2>&1 "
+                f"&& echo TRAP_OPEN=$a; done; echo TRAP_DONE")
+
     def gen(self, name):
         meta = self.cache / f"{name}.meta.json"
         return json.loads(meta.read_text())["generation"] if meta.exists() else None
@@ -1528,6 +1586,8 @@ class RealTests(unittest.TestCase):
                  "except OSError as e: r['dns']=type(e).__name__\n"
                  "print('PROBE'+json.dumps(r), flush=True)\n")
         (self.proj / "probe.py").write_text(probe)
+        before = set(subprocess.run(["podman", "pod", "ps", "-q", "--filter", "name=mvm-ports-"],
+                                        capture_output=True, text=True).stdout.split())    # other sessions' runs may be up
         script = "cd /tmp && (python3 -m http.server 8000 >/dev/null 2>&1 &) && python3 /src/probe.py && sleep 25"
         res = {}
         th = threading.Thread(target=lambda: res.update(r=self.mvm("run", "-p", f"{P}:8000", "-i",
@@ -1558,8 +1618,8 @@ class RealTests(unittest.TestCase):
         self.assertFalse({k: v for k, v in out.items() if v == "OPEN"}, out)
         self.assertEqual(len(out), len(targets) + 1)
         self.assertEqual(hits, [], "the guest reached the host listener")
-        self.assertFalse(subprocess.run(["podman", "pod", "ps", "-q", "--filter", "name=mvm-ports-"],
-                                        capture_output=True, text=True).stdout.strip())
+        self.assertEqual(set(subprocess.run(["podman", "pod", "ps", "-q", "--filter", "name=mvm-ports-"],
+                                        capture_output=True, text=True).stdout.split()) - before, set())   # ours is gone
 
     def test_confined_pull(self):
         """Proves: an image pull goes through the proxy and observer, loads offline by digest,
@@ -1588,12 +1648,16 @@ class RealTests(unittest.TestCase):
         krun with apk through the proxy, tags only a clean build, leaks no proxy env; a step
         reaching a disallowed host is held (exit 3) and nothing is tagged."""
         cf = self.proj / "Containerfile"
-        cf.write_text("FROM docker.io/library/busybox:1.37 AS b\nFROM docker.io/library/alpine:3.24\n"
-                      "COPY --from=b /bin/busybox /bb\nRUN apk add --no-cache jq && uname -r > /kernel\n")
         tag = "localhost/mvm-test-build:1"
         try:
-            r = self.mvm("image", "build", "-t", tag, "-f", str(cf))
-            self.assertEqual(r.returncode, 0, r.stderr)
+            with self.trap() as (tport, addrs, hits):  # a RUN step must not reach a host listener either
+                trap = self.trap_probe(tport, addrs).replace("echo TRAP_OPEN=$a", "{ echo TRAP_OPEN=$a; exit 1; }")
+                cf.write_text("FROM docker.io/library/busybox:1.37 AS b\nFROM docker.io/library/alpine:3.24\n"
+                              "COPY --from=b /bin/busybox /bb\nRUN apk add --no-cache jq && uname -r > /kernel\n"
+                              f"RUN {trap}\n")
+                r = self.mvm("image", "build", "-t", tag, "-f", str(cf))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(hits, [], "a RUN step reached a host listener")
             env = subprocess.run(["podman", "image", "inspect", "--format", "{{json .Config.Env}}", tag],
                                  capture_output=True, text=True, check=True).stdout
             self.assertNotIn("127.0.0.1", env)
@@ -1702,7 +1766,12 @@ class RealTests(unittest.TestCase):
             'echo "allowed=$(conn proxy.golang.org)"; '
             'echo "allowed_port22=$(printf "CONNECT proxy.golang.org:22 HTTP/1.1\\r\\n\\r\\n" | nc -w 8 127.0.0.1 $P | head -1)"'
         )
-        r = self.mvm("fetch", "go", "--", "sh", "-c", probe)
+        with self.trap() as (tport, addrs, hits):     # host 0.0.0.0 listener via tailnet/bridge/LAN/lo
+            self.assertIn("127.0.0.1", addrs)
+            r = self.mvm("fetch", "go", "--", "sh", "-c", probe + "; " + self.trap_probe(tport, addrs))
+        self.assertIn("TRAP_DONE", r.stdout)
+        self.assertNotIn("TRAP_OPEN", r.stdout)
+        self.assertEqual(hits, [], "a fetch VM reached a host listener")
         # The probe itself tried an unlisted host, so the run is held (exit 3), not committed.
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("direct=closed", r.stdout)

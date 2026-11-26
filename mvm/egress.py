@@ -121,11 +121,87 @@ def allowlist(cfg: dict, eco: str) -> list[str]:
     return sorted({*DEFAULT_ALLOW.get(eco, []), *cfg.get("allow", {}).get(eco, [])})
 
 
-def vm_network_args(port: int) -> list[str]:
+def vm_pasta(port: int) -> str:
     """pasta: IPv4 only, outbound sockets bound to loopback, only <port> forwarded to
     the host, and its DNS forwarder pointed at an unroutable address (TEST-NET)."""
-    return ["--dns=none",
-            f"--network=pasta:-4,-o,127.0.0.1,--no-map-gw,-T,{port},--dns-host,192.0.2.1"]
+    return f"pasta:-4,-o,127.0.0.1,--no-map-gw,-T,{port},--dns-host,192.0.2.1"
+
+
+# pasta alone is not enough: its outbound sockets are bound to 127.0.0.1, and Linux lets
+# a loopback-bound socket reach every *local* address, so a krun guest reached host
+# listeners on 0.0.0.0 through the tailnet and bridge addresses (proven). The VM's pod is
+# sealed: only its own loopback, where pasta's one -T port is the way to the proxy.
+# (krun's TSI routes even the guest's own 127.0.0.1 sockets through this namespace, so
+# all of lo is accepted.) Reject rather than drop: a dropped SYN leaves a TSI connect()
+# waiting out the retries whatever the guest's timeout.
+VM_SEAL_SH = r"""set -eu
+nft -f - <<NFT
+table inet mvm_vm_seal {
+  chain out {
+    type filter hook output priority 0; policy drop;
+    oifname "lo" accept
+    meta l4proto tcp reject with tcp reset
+    reject
+  }
+}
+NFT
+nft list table inet mvm_vm_seal | grep -q 'policy drop'
+echo MVM_VM_SEALED
+"""
+
+
+def vm_pod_argv(name: str, port: int, labels: list[str]) -> list[str]:
+    return ["podman", "pod", "create", "--name", name, *labels, "--dns=none", f"--network={vm_pasta(port)}"]
+
+
+class VMPod:
+    """The networked VM's own pod: pasta with only the proxy port forwarded, and its
+    namespace sealed by a one-shot NET_ADMIN container (VM_SEAL_SH) before the VM starts.
+    `run_args` join it (podman run); `build_args` join its namespace (podman build)."""
+
+    def __init__(self, run_id: str, port: int):
+        self.run_id, self.port = run_id, port
+        self.name = f"mvm-vm-{run_id}"
+        self.netns = ""
+
+    def __enter__(self) -> VMPod:
+        if not firewall_image_present():
+            raise core.MvmError(f"egress firewall image missing: {FIREWALL_IMAGE} (run `make smokescreen` in "
+                                "the mvm repo)")
+        labels = ["--label", f"mvm.run={self.run_id}", "--label", f"mvm.pid={os.getpid()}"]
+        try:
+            r = subprocess.run(vm_pod_argv(self.name, self.port, labels), capture_output=True, text=True)
+            if r.returncode != 0:
+                raise core.MvmError(f"could not create the VM pod: {r.stderr.strip()}")
+            with tempfile.TemporaryDirectory(prefix="mvm-vmseal-") as d:
+                (Path(d) / "seal.sh").write_text(VM_SEAL_SH)
+                fw = subprocess.run(["podman", "run", "--rm", "--pull=never", "--pod", self.name, *labels,
+                                     "--cap-drop=all", "--cap-add=NET_ADMIN", "--read-only",
+                                     "-v", f"{d}/seal.sh:/seal.sh:ro,z", FIREWALL_IMAGE, "sh", "/seal.sh"],
+                                    capture_output=True, text=True)
+            if fw.returncode != 0 or "MVM_VM_SEALED" not in fw.stdout:
+                raise core.MvmError(f"could not seal the VM pod: {(fw.stderr or fw.stdout).strip()}")
+            infra = subprocess.run(["podman", "pod", "inspect", "--format", "{{.InfraContainerID}}", self.name],
+                                   capture_output=True, text=True).stdout.strip()
+            pid = subprocess.run(["podman", "inspect", "--format", "{{.State.Pid}}", infra],
+                                 capture_output=True, text=True).stdout.strip()
+            if not pid.isdigit() or pid == "0":
+                raise core.MvmError("the VM pod's network namespace is not running")
+            self.netns = f"/proc/{pid}/ns/net"
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def run_args(self) -> list[str]:
+        return ["--pod", self.name]
+
+    def build_args(self) -> list[str]:
+        return ["--dns=none", f"--network=ns:{self.netns}"]
+
+    def __exit__(self, *exc) -> None:
+        subprocess.run(["podman", "pod", "rm", "-f", "-t", "0", self.name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def proxy_env(port: int) -> dict[str, str]:

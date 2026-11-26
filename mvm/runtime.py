@@ -241,7 +241,8 @@ def execute(plan: Plan) -> int:
                     if plan.l7 is not None and plan.l7_ca is not None:
                         plan.l7_ca.write_bytes(px.ca_pem)      # the guest trusts only this CA
                     plan.env = {**plan.env, **egress.proxy_env(px.port)}
-                    net_args = egress.vm_network_args(px.port)
+                    vm_pod = stack.enter_context(egress.VMPod(run_id, px.port))   # sealed: proxy port only
+                    net_args = vm_pod.build_args() if plan.argv_fn else vm_pod.run_args()
                     if plan.observe:
                         ob = stack.enter_context(observer.Observer(run_id, px.name, px.iface, plan.allow))
                 if plan.argv_fn:
