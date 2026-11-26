@@ -1,10 +1,10 @@
-# mvm observer: ndpiReader from upstream nDPI 6.0 (release tarball, sha256 checked here and
-# in the Makefile), on Debian pinned by digest. Built by `make observer` with the tarball as context.
+# mvm observer: ndpiReader from upstream nDPI 5.0, the last all-LGPLv3 release (see Makefile);
+# release tarball sha256-checked here and in the Makefile, on Debian pinned by digest. Built by `make observer`.
 FROM docker.io/library/debian@sha256:4876fdea29cac1a33a3195f1eb1952feb1fca7dd6dd00be3e2f1879cf20d34d2 AS build
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential autoconf automake libtool pkg-config libpcap-dev ca-certificates >/dev/null
-COPY nDPI-6.0.tar.gz /tmp/
-RUN echo "21fc40cab5505942c0b21d9bbaf73e9adf8162ddfe782e4cd072cab855a2eda9  /tmp/nDPI-6.0.tar.gz" | sha256sum -c - \
- && tar xzf /tmp/nDPI-6.0.tar.gz -C /tmp && cd /tmp/nDPI-6.0 \
+COPY nDPI-5.0.tar.gz /tmp/
+RUN echo "8b0d3dc0c8a6a68578e09a18c922021ef6458d4aca1c7a20ce04efc267aa9ea5  /tmp/nDPI-5.0.tar.gz" | sha256sum -c - \
+ && tar xzf /tmp/nDPI-5.0.tar.gz -C /tmp && cd /tmp/nDPI-5.0 \
  && ./autogen.sh >/dev/null && ./configure -q --prefix=/opt/ndpi >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 \
  && make -s install >/dev/null && cp example/ndpiReader /opt/ndpi/bin/ && test -x /opt/ndpi/bin/ndpiReader
 

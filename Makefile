@@ -6,8 +6,10 @@ LIBDIR ?= $(PREFIX)/lib/mvm
 SMOKESCREEN_REV ?= 5b4b7aabca9bc70a8435358d648edd03294c299e
 SMOKESCREEN_SRC ?= $(HOME)/.cache/mvm-src/smokescreen
 # nDPI (ntop) for the observer (on by default; fetch refuses without its image): release tarball pinned by sha256.
-NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/6.0.tar.gz
-NDPI_SHA256 ?= 21fc40cab5505942c0b21d9bbaf73e9adf8162ddfe782e4cd072cab855a2eda9
+# Pinned to 5.0, the last release wholly under LGPLv3: from 6.0 the TLS, QUIC, DNS and DHCP
+# dissectors are ntop dual-licensed (free only for not-for-profit use). Never take 6.x code.
+NDPI_URL ?= https://github.com/ntop/nDPI/archive/refs/tags/5.0.tar.gz
+NDPI_SHA256 ?= 8b0d3dc0c8a6a68578e09a18c922021ef6458d4aca1c7a20ce04efc267aa9ea5
 NDPI_SRC ?= $(HOME)/.cache/mvm-src/ndpi
 MANDIR ?= $(PREFIX)/share/man/man1
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
@@ -63,10 +65,10 @@ smokescreen:
 
 observer:
 	install -d "$(NDPI_SRC)"
-	@test -f "$(NDPI_SRC)/nDPI-6.0.tar.gz" || curl -fsSL -o "$(NDPI_SRC)/nDPI-6.0.tar.gz" "$(NDPI_URL)"
-	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-6.0.tar.gz" | sha256sum -c -
-	podman build -q -t localhost/mvm-observer:1 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
-	@echo "Built localhost/mvm-observer:1 (nDPI 6.0) (the fetch observer, on by default)"
+	@test -f "$(NDPI_SRC)/nDPI-5.0.tar.gz" || curl -fsSL -o "$(NDPI_SRC)/nDPI-5.0.tar.gz" "$(NDPI_URL)"
+	echo "$(NDPI_SHA256)  $(NDPI_SRC)/nDPI-5.0.tar.gz" | sha256sum -c -
+	podman build -q -t localhost/mvm-observer:2 -f "$(CURDIR)/egress/Containerfile.observer" "$(NDPI_SRC)" >/dev/null
+	@echo "Built localhost/mvm-observer:2 (nDPI 5.0) (the fetch observer, on by default)"
 
 # Daily `mvm check --all` (osv-scanner on every known project's lockfiles), as a user timer.
 timer:

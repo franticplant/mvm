@@ -24,8 +24,8 @@ from pathlib import Path
 
 from . import core
 
-# Built by `make observer`: nDPI 6.0 release tarball pinned by sha256, pinned Debian.
-OBSERVER_IMAGE = "localhost/mvm-observer:1"
+# Built by `make observer`: nDPI 5.0 (last all-LGPLv3 release) tarball pinned by sha256, pinned Debian.
+OBSERVER_IMAGE = "localhost/mvm-observer:2"
 READY_MARK = "Capturing live traffic"
 READY_TIMEOUT = 15.0
 # ndpiReader prints its traffic statistics on SIGINT; frames it could not parse count here.

@@ -1034,12 +1034,12 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
         """Proves: with the observer on, a TLS ClientHello whose SNI is outside the allowlist,
         sent through a CONNECT the proxy allowed, holds the run (exit 3, nothing committed).
         Negative control in the same run: the honest SNI is observed and not flagged.
-        Needs smokescreen, localhost/mvm-observer:1 (make observer) and internet."""
+        Needs smokescreen, localhost/mvm-observer:2 (make observer) and internet."""
         lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
         if not (lib / "smokescreen").is_file():
             self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:2 (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
@@ -1064,8 +1064,8 @@ func main() { hello("proxy.golang.org"); hello("example.com") }
     def test_observer_quiet_fetch_commits(self):
         """Proves: with the observer on, a fetch that makes no connection still commits
         (ndpiReader writes a flow file and a clean stats line even with no traffic)."""
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:2 (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
@@ -1110,8 +1110,8 @@ func main() { tunnel(false); tunnel(true) }
         lib = Path(os.environ.get("MVM_LIB_DIR", Path.home() / ".local/lib/mvm"))
         if not (lib / "smokescreen").is_file():
             self.skipTest(f"no smokescreen in {lib} (make smokescreen)")
-        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:1"]).returncode != 0:
-            self.skipTest("no localhost/mvm-observer:1 (make observer)")
+        if subprocess.run(["podman", "image", "exists", "localhost/mvm-observer:2"]).returncode != 0:
+            self.skipTest("no localhost/mvm-observer:2 (make observer)")
         cfg = Path(self.tmp.name) / "obs.toml"
         cfg.write_text("[observer]\nenabled = true\n")
         self.env["MVM_CONFIG"] = str(cfg)
