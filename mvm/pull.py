@@ -29,7 +29,13 @@ from pathlib import Path
 from . import core, egress, observer
 
 SKOPEO_IMAGE = "localhost/mvm-skopeo:1"
-CA_BUNDLE = Path("/etc/pki/tls/certs/ca-bundle.crt")
+# The host's CA bundle, copied into each pull: Fedora/RHEL, Debian/Ubuntu/Arch, openSUSE.
+CA_BUNDLES = (Path("/etc/pki/tls/certs/ca-bundle.crt"), Path("/etc/ssl/certs/ca-certificates.crt"),
+              Path("/etc/ssl/ca-bundle.pem"))
+
+
+def ca_bundle() -> Path | None:
+    return next((p for p in CA_BUNDLES if p.is_file()), None)
 # Inside the VM: signatures are not checked (trust is the digest pin, on first use);
 # every transport but the registry and the local output is refused.
 POLICY = {"default": [{"type": "reject"}],
@@ -50,8 +56,8 @@ def ready() -> str:
     """Why a confined pull cannot run, or ''."""
     if subprocess.run(["podman", "image", "exists", SKOPEO_IMAGE]).returncode != 0:
         return f"image pulls need {SKOPEO_IMAGE} (run `make skopeo` in the mvm repo)"
-    if not CA_BUNDLE.is_file():
-        return f"image pulls need the host CA bundle {CA_BUNDLE}"
+    if ca_bundle() is None:
+        return f"image pulls need a host CA bundle (none of {', '.join(map(str, CA_BUNDLES))})"
     return ""
 
 
@@ -132,7 +138,7 @@ def confined_pull(ref: str, cfg: dict | None = None) -> str:
         (work / "policy.json").write_text(json.dumps(POLICY))
         # Copied fresh per pull: the host file is labelled cert_t, and relabelling a
         # system file (:z) is not an option.
-        shutil.copyfile(CA_BUNDLE, work / "ca.crt")
+        shutil.copyfile(ca_bundle(), work / "ca.crt")
         plan = Plan(kind="pull", eco=None, image=SKOPEO_IMAGE, memory="1g", cmd=copy_argv(ref),
                     src=None, net=True, allow=egress.allowlist(cfg, "pull"), observe=observer.enabled(cfg),
                     env={"TMPDIR": "/out/tmp", "HOME": "/out/tmp", "SSL_CERT_FILE": "/etc/mvm/ca.crt"},

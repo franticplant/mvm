@@ -90,6 +90,7 @@ Linux with `/dev/kvm`, `podman` + `crun-krun`, `e2fsprogs`, Python 3.11+ (standa
 
 ```bash
 sudo dnf install podman crun-krun e2fsprogs
+make setup          # all of: install, smokescreen, observer, skopeo (what a fresh machine needs)
 make install        # ~/.local/bin/mvm, ~/.local/lib/mvm (package), man page, completions
 make smokescreen    # build the pinned egress proxy offline with mvm, and its port-filter image; fetch refuses without them
 make skopeo         # build skopeo offline with mvm (static, FROM scratch); image pulls refuse without it

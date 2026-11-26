@@ -280,6 +280,21 @@ class PullTests(Base):
         with self.assertRaises(SystemExit):
             self.mvm.load_config()
 
+    def test_ca_bundle_probes_distro_paths_in_order(self):
+        t = Path(self.tmp.name)
+        fedora, debian, suse = t / "fedora.crt", t / "debian.crt", t / "suse.pem"
+        with mock.patch.object(self.mvm.pull, "CA_BUNDLES", (fedora, debian, suse)):
+            self.assertIsNone(self.mvm.pull.ca_bundle())
+            suse.write_text("x")
+            self.assertEqual(self.mvm.pull.ca_bundle(), suse)
+            debian.write_text("x")
+            self.assertEqual(self.mvm.pull.ca_bundle(), debian)
+            fedora.write_text("x")
+            self.assertEqual(self.mvm.pull.ca_bundle(), fedora)
+            fedora.unlink()
+            fedora.mkdir()                      # a directory is not a bundle
+            self.assertEqual(self.mvm.pull.ca_bundle(), debian)
+
     def test_local_images_are_never_pulled(self):
         with self.assertRaises(self.mvm.MvmError):
             self.mvm.pull.confined_pull("localhost/mvm-skopeo:1", {})

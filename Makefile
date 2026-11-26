@@ -23,7 +23,13 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BASH_COMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSH_COMPDIR ?= $(if $(and $(filter $(HOME)/.local,$(PREFIX)),$(wildcard $(HOME)/.oh-my-zsh/custom)),$(HOME)/.oh-my-zsh/custom/completions,$(PREFIX)/share/zsh/site-functions)
 
-.PHONY: install uninstall test test-real lint smokescreen skopeo observer ndpi-oracle timer
+.PHONY: setup install uninstall test test-real lint smokescreen skopeo observer ndpi-oracle timer
+
+# Everything a fresh machine needs: mvm, the egress proxy, the observer, confined pulls.
+setup: install
+	$(MAKE) smokescreen
+	$(MAKE) observer
+	$(MAKE) skopeo
 
 install:
 	install -d "$(BINDIR)" "$(LIBDIR)/mvm" "$(MANDIR)" "$(BASH_COMPDIR)" "$(ZSH_COMPDIR)"
