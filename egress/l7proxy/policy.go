@@ -29,6 +29,21 @@ type Policy struct {
 	pinned map[string]bool // "host" + "\x00" + path
 }
 
+// MaxPins bounds redirect pins per run (a pull makes one per blob).
+const MaxPins = 4096
+
+// HostAllowed: host is one of Hosts, or under a "*.x" entry (Smokescreen's semantics).
+func (p *Policy) HostAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, h := range p.Hosts {
+		h = strings.ToLower(h)
+		if host == h || (strings.HasPrefix(h, "*.") && strings.HasSuffix(host, h[1:])) {
+			return true
+		}
+	}
+	return false
+}
+
 func loadPolicy(path string) (*Policy, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -144,8 +159,14 @@ func (p *Policy) Pin(base *url.URL, location string) (string, bool) {
 		return "", false
 	}
 	h := strings.ToLower(t.Hostname())
+	if !p.HostAllowed(h) {
+		return "", false
+	}
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.pinned) >= MaxPins {
+		return "", false
+	}
 	p.pinned[h+"\x00"+path] = true
-	p.mu.Unlock()
 	return h + path, true
 }

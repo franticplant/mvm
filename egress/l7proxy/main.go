@@ -182,6 +182,11 @@ func (px *Proxy) handle(c net.Conn) {
 		deny(c, "CONNECT host:443 only")
 		return
 	}
+	if !px.policy.HostAllowed(host) { // before any leaf is minted for it
+		px.log(map[string]any{"msg": "L7", "allow": false, "method": "CONNECT", "host": host, "reason": "host not in the allowlist"})
+		deny(c, "host not in the allowlist")
+		return
+	}
 	if _, err := io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		return
 	}

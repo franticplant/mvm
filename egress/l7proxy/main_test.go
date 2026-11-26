@@ -80,6 +80,19 @@ func TestPolicy(t *testing.T) {
 	if pin, ok := p.Pin(u("https://registry.test/v2/library/busybox/blobs/x"), "/v2/rel/target"); !ok || pin != "registry.test/v2/rel/target" {
 		t.Errorf("relative redirect: %q %v", pin, ok)
 	}
+	if _, ok := p.Pin(u("https://registry.test/v2/"), "https://evil.example/x"); ok {
+		t.Error("pinned a host outside the allowlist")
+	}
+	full := pol(t)
+	for i := 0; i < MaxPins+5; i++ {
+		full.Pin(u("https://registry.test/v2/"), "https://cdn.test/b/"+strings.Repeat("x", 1)+string(rune('a'+i%26))+"/"+itoa(i))
+	}
+	if len(full.pinned) != MaxPins {
+		t.Errorf("pins not capped: %d", len(full.pinned))
+	}
+	if !p.HostAllowed("CDN.test.") || p.HostAllowed("evil.example") {
+		t.Error("HostAllowed")
+	}
 	off := pol(t)
 	off.Redirects = false
 	if _, ok := off.Pin(u("https://registry.test/"), "https://cdn.test/x"); ok {
@@ -168,6 +181,14 @@ func status(t *testing.T, c *http.Client, method, target string) int {
 	return resp.StatusCode
 }
 
+func itoa(i int) string {
+	const d = "0123456789"
+	if i < 10 {
+		return d[i : i+1]
+	}
+	return itoa(i/10) + d[i%10:i%10+1]
+}
+
 func TestEndToEnd(t *testing.T) {
 	c, _, logs, seen := start(t)
 	if s := status(t, c, "GET", "https://registry.test/v2/"); s != 200 {
@@ -236,7 +257,8 @@ func TestTunnelIdentity(t *testing.T) {
 	}
 	// A plain-HTTP proxy request (no tunnel) and CONNECT to port 80 are refused.
 	for _, line := range []string{"GET http://registry.test/v2/ HTTP/1.1\r\nHost: registry.test\r\n\r\n",
-		"CONNECT registry.test:80 HTTP/1.1\r\nHost: registry.test:80\r\n\r\n"} {
+		"CONNECT registry.test:80 HTTP/1.1\r\nHost: registry.test:80\r\n\r\n",
+		"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n"} {
 		a, b := net.Pipe()
 		go px.handle(b)
 		go io.WriteString(a, line)
