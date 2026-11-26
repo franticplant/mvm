@@ -177,6 +177,28 @@ class ProjectTests(Base):
             with self.assertRaises(SystemExit):
                 self.mvm.parse_opts(bad, False)
 
+    def test_run_user_goes_to_podman_only_for_run(self):
+        opts, _ = self.mvm.parse_opts(["-i", "img", "-u", "1000:1000", "--", "id"], True)
+        self.assertEqual(opts["user"], "1000:1000")
+        self.assertEqual(self.mvm.parse_opts(["--user", "pwuser", "-i", "i", "--", "x"], True)[0]["user"], "pwuser")
+        for bad in (["-u", "root;x", "-i", "i", "--", "x"], ["-u", "", "-i", "i", "--", "x"], ["-u", "a:b:c", "-i", "i", "--", "x"]):
+            with self.assertRaises(SystemExit):
+                self.mvm.parse_opts(bad, True)
+        with self.assertRaises(SystemExit):            # build takes no -u
+            self.mvm.parse_opts(["-u", "1000", "--", "x"], False)
+        p = self.mvm.Plan(kind="run", eco=None, image="img@sha256:" + "a" * 64, memory="1g", cmd=["id"],
+                          src=None, user="pwuser")
+        argv = self.mvm.podman_argv(p, "RID", {}, Path("/e"))
+        self.assertEqual(argv[argv.index("--user") + 1], "pwuser")
+        self.assertLess(argv.index("--user"), argv.index("img@sha256:" + "a" * 64))
+        self.assertNotIn("--user", self.mvm.podman_argv(self.mvm.Plan(kind="run", eco=None, image="i", memory="1g",
+                                                                      cmd=["id"], src=None), "R", {}, Path("/e")))
+        for kind, caches in (("build", []), ("run", [self.mvm.Cache("go-mod", "/c", rw=True)])):
+            p = self.mvm.Plan(kind=kind, eco=None, image="i", memory="1g", cmd=["x"], src=None, user="1000",
+                              caches=caches)
+            with self.assertRaises(self.mvm.MvmError):
+                self.mvm.podman_argv(p, "R", {"go-mod": Path("/m")}, Path("/e"))
+
     def test_image_repo_strips_tag_not_port(self):
         self.assertEqual(self.mvm.image_repo("docker.io/library/golang:1.27-alpine"), "docker.io/library/golang")
         self.assertEqual(self.mvm.image_repo("localhost:5000/x"), "localhost:5000/x")

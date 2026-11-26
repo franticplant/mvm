@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import signal
 import subprocess
 import tempfile
@@ -16,8 +17,12 @@ from .project import changed_manifests, check_writable, copy_back, detect_ecos, 
 from .runtime import Plan, execute, reap_orphans
 
 
+# podman --user values: name or uid, optionally :group or :gid
+USER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?")
+
+
 def parse_opts(args: list[str], allow_image: bool) -> tuple[dict, list[str]]:
-    opts: dict = {"writable": [], "interactive": False, "image": None, "positional": []}
+    opts: dict = {"writable": [], "interactive": False, "image": None, "user": "", "positional": []}
     i = 0
     while i < len(args):
         a = args[i]
@@ -33,6 +38,11 @@ def parse_opts(args: list[str], allow_image: bool) -> tuple[dict, list[str]]:
             i += 1
         elif allow_image and a == "-i" and i + 1 < len(args):
             opts["image"] = args[i + 1]
+            i += 2
+        elif allow_image and a in ("-u", "--user") and i + 1 < len(args):
+            if not USER_RE.fullmatch(args[i + 1]):
+                die(f"bad user {args[i + 1]!r}: give NAME, UID, NAME:GROUP or UID:GID")
+            opts["user"] = args[i + 1]
             i += 2
         elif a.startswith("-"):
             die(f"unknown option {a!r} (see mvm --help)")
@@ -233,14 +243,14 @@ def cmd_build(args: list[str]) -> int:
 def cmd_run(args: list[str]) -> int:
     opts, cmd = parse_opts(args, allow_image=True)
     if not opts["image"] or opts["positional"]:
-        die("usage: mvm run -i IMAGE [-w DIR] [--it] -- CMD")
+        die("usage: mvm run -i IMAGE [-u USER] [-w DIR] [--it] -- CMD")
     root = Path.cwd().resolve()
     cfg = load_config()
     plan = Plan(kind="run", eco=None, image=pinned(opts["image"]),
                 memory=memory_for(cfg, "run", "2g"), cmd=cmd, src=root,
                 writable=check_writable(root, opts["writable"]),
                 masks=find_masks(root, cfg.get("mask", DEFAULT_MASK)),
-                interactive=opts["interactive"], project=root)
+                interactive=opts["interactive"], project=root, user=opts["user"])
     return execute(plan)
 
 
@@ -484,7 +494,7 @@ mvm - run dev tooling in throwaway Podman+krun microVMs
                                        --learn: allow but log every host, commit nothing
   mvm build [go|rust|node] [-w DIR] [--it] -- CMD
                                        build offline against the fetched caches
-  mvm run -i IMAGE [-w DIR] [--it] -- CMD
+  mvm run -i IMAGE [-u USER] [-w DIR] [--it] -- CMD
                                        run any image offline
   mvm check [--all]                    osv-scanner on the lockfiles (here, or every
                                        known project); also runs before every fetch

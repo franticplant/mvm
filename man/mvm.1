@@ -18,6 +18,8 @@ mvm \- run dev tooling in throwaway Podman+krun microVMs
 .br
 .B mvm run \-i
 .I IMAGE
+.RB [ \-u
+.IR USER ]
 .RB [ \-w
 .IR DIR ]
 .RB [ \-\-it ]
@@ -141,6 +143,26 @@ Interactive terminal.
 .BI \-i " IMAGE"
 Image for
 .BR run .
+.TP
+.BR \-u ", " \-\-user " \fIUSER\fR"
+.B run
+only: run the command as
+.I USER
+(a name from the image,
+.IR UID ,
+or
+.IR UID:GID ),
+e.g. for Chromium, whose sandbox refuses uid 0. The project is still owned by
+guest root: that user needs it traversable (mode 755), and a
+.B \-w
+directory writable by it
+.RB ( "chmod 777 DIR" " or " "podman unshare chown UID DIR" ).
+Files it writes there are owned by a subordinate uid on the host (remove them with
+.BR "podman unshare rm" ).
+.B build
+and
+.B fetch
+always run as guest root: they loop\-mount the caches.
 .SH CACHES AND COMMIT-ON-CLEAN
 Caches are sparse ext4 image files in
 .IR ~/.cache/mvm ,
@@ -271,6 +293,9 @@ mvm fetch rust \-\- cargo generate\-lockfile
 mvm build \-w build \-\- go build \-o build/app ./cmd/app
 mvm build node \-\- npm rebuild
 mvm run \-i docker.io/library/alpine:3.24 \-\- uname \-a
+mvm run \-u 1000:1000 \-i docker.io/library/alpine:3.24 \-\- id
+mvm pull ghcr.io/astral\-sh/ruff:0.8.4\-alpine
+mvm image build \-t localhost/jq:1 \-f Containerfile
 .fi
 .SH CAVEATS
 podman's

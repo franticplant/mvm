@@ -1,13 +1,20 @@
 # mvm
 
+[![CI](https://github.com/franticplant/mvm/actions/workflows/ci.yml/badge.svg)](https://github.com/franticplant/mvm/actions/workflows/ci.yml)
+
 Run dev tooling (`go`, `cargo`, `npm`, or any OCI image) in throwaway KVM microVMs via **Podman + `crun-krun`**. Offline and read-only by default; dependencies are fetched in a separate, manifest-only step; caches are committed only when a command succeeds.
 
 ```bash
-mvm fetch                                        # download deps (the only networked step)
-mvm build -w build -- go build -o build/app ./cmd/app
+mvm fetch                                        # download deps (networked, allowlisted, manifests only)
+mvm build -w build -- go build -o build/app ./cmd/app   # offline from here on
 mvm build rust -- cargo test
 mvm run -i docker.io/library/alpine:3.24 -- uname -a
+mvm run -u 1000:1000 -i IMAGE -- CMD             # as a non-root user (e.g. Chromium's sandbox)
+mvm pull ghcr.io/astral-sh/ruff:0.8.4-alpine     # confined image pull, pinned by digest
+mvm image build -t localhost/jq:1 -f Containerfile   # RUN steps in krun, OS mirrors only
 ```
+
+The networked steps are `fetch`, `check`, `pull`/`update` and `image build`, each confined to its own allowlist through a per-run proxy and TLS observer; `build` and `run` have no network at all.
 
 ## The model
 
@@ -15,31 +22,78 @@ mvm run -i docker.io/library/alpine:3.24 -- uname -a
 |---|---|---|---|
 | `mvm fetch [go\|rust\|node] [-- CMD]` | yes | **only** `go.mod`/`go.sum`, `Cargo.toml`/`Cargo.lock`, `package.json`/`package-lock.json` (Cargo targets as empty stubs) | dependency caches; changed manifests are copied back |
 | `mvm build [go\|rust\|node] -- CMD` | no | the project, read-only, with `.git`, `.env*` and key files hidden | build caches, `node_modules`, and `-w DIR` |
-| `mvm run -i IMAGE -- CMD` | no | same as build | `-w DIR` only |
+| `mvm run -i IMAGE [-u USER] -- CMD` | no | same as build | `-w DIR` only |
 | `mvm check [--all]` | only api.osv.dev | **only** the lockfiles | nothing (a check record) |
 | `mvm pull IMAGE`, `mvm update` | only image registries | nothing | the image, loaded offline after a clean run |
 | `mvm image build -t localhost/NAME:TAG [-f FILE]` | only OS package mirrors | **only** the Containerfile | the `localhost/` tag, after a clean build |
 
+### Dependencies: fetch and build
+
 - **No third-party code runs with network.** `go mod download` and `cargo fetch` run none; npm runs with `--ignore-scripts` (run them offline: `mvm build node -- npm rebuild`); Go may not download a newer toolchain (`GOTOOLCHAIN=local`).
 - **Changing dependencies** is a fetch with a command: `mvm fetch go -- go get golang.org/x/net@latest`, `mvm fetch rust -- cargo generate-lockfile`, `mvm fetch node -- npm install --ignore-scripts left-pad`. Only manifest/lockfile changes flow back, and mvm lists them.
 - **Commit-on-clean.** Every writable cache is a reflink copy for the duration of the run and replaces the cache atomically only on exit 0. A failure, Ctrl-C, crash or `kill -9` leaves the cache exactly as it was.
+
+### Egress: allowlist proxy, held on denial
+
+- A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries.
+- No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs).
+- Every connection is logged with bytes in/out; denials are printed and kept in the run record.
+- **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
+- **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.
+
+### TLS observer (on by default)
+
+- mvm's own passive TLS sensor (`mvm/tlsobs.py`, stdlib Python, in the official Python image pinned by digest) runs as a sidecar in the proxy pod. For every outbound connection it reassembles the start of the client's stream and records whether it is a TLS ClientHello, its SNI and [JA4](https://github.com/FoxIO-LLC/ja4) fingerprint, and the bytes each way.
+- **Holds the run** (exit 3): a TLS name outside the allowlist, no SNI, a connection that is not TLS (e.g. plaintext HTTP through CONNECT) or conflicting retransmissions hold the run like a denial (exit 3): the proxy only sees the CONNECT host, so this catches SNI-level domain fronting.
+- **Limit:** Fronting by the HTTP `Host` header inside the encrypted connection (allowed SNI, another site on the same CDN) is invisible to any passive observer; it depends on the CDN refusing mismatches.
+- **Fails closed:** a missing image refuses the fetch; a dead sensor, unreadable flows, kernel packet drops, or a proxy connection with no observed flow means nothing is committed (exit 5).
+- It is written clean-room from the RFCs and FoxIO's BSD-3 JA4 spec; real tests check it against nDPI 5.0 on the same packets.
+- `[observer] enabled = false` turns it off; `mvm status` prints `observer off` then.
+- **Telemetry.** Observe-only, for encrypted traffic analysis (nothing is enforced on these): each flow also records kernel timestamps (`ts_start`, `duration_ms`), packets each way, `data_ratio` (bytes out / total), the first ALPN, the offered TLS version, and SPLT, the first 20 data packets as `[±payload bytes, ms since the previous one]` (+ out, − in). They go into the run record (the last 200 runs; `~/.local/state/mvm` is 0700); `[observer] log = "/abs/path/flows.jsonl"` (off by default) also appends every flow with its `run_id`, `kind` and `eco`, for a long-term corpus.
+
+### Dependency checks
+
+- **Before every fetch.** [osv-scanner](https://github.com/google/osv-scanner) checks the lockfiles in a microVM that sees only them and reaches only `api.osv.dev` through the same proxy.
+- A package with an OSV `MAL-` advisory ([OpenSSF malicious packages](https://github.com/ossf/malicious-packages)) refuses the fetch (exit 6); known vulnerabilities are printed and recorded, not blocking.
+- If a fetch command changed the lockfile (`npm install x`), the new lockfile is checked before anything is committed or copied back.
+- A lockfile that lists no packages (fresh `npm init`) passes; any other check that cannot complete refuses the fetch (`[check] before_fetch = false` turns it off).
+- Call analysis and manifest resolution are off (`--no-call-analysis=all --no-resolve`): nothing runs and no other host is needed.
+- **Daily check and notifications.** `mvm check --all` checks every project mvm has fetched or checked; `make timer` installs it as a daily systemd user timer. With `[notify] ntfy = "https://ntfy.sh/<topic>"`, trips (malicious packages, held runs, failed proxy/observer, failed checks) are posted there. `mvm status` shows the last check per project and the trips of the last 24 hours.
+
+### Images
+
 - **Pinned images.** The first use of an image tag pins its digest; `mvm update` re-pulls and shows what changed. Every container mvm starts uses `--pull=never`: a pinned image that is missing locally fails the run (re-pin with `mvm pull TAG`); it is never fetched outside the egress.
-- **Confined image pulls.** `mvm pull`, `mvm update` and an image's first use pull through the same proxy and observer as fetch: a static skopeo (`make skopeo`, pure Go, in a `FROM scratch` image) is the microVM's only process and copies the image into a `dir:` layout under `~/.cache/mvm/pulls`. Only after a clean run does the host load it offline (`podman pull dir:...`, which re-checks every blob digest) and pin it by the digest of its platform manifest (`dir:` keeps the registry's manifest bytes; an OCI archive would convert Docker manifests and change the digest). The download is removed whatever happens. A registry outside the allowlist holds the pull (exit 3) with the `[allow] pull = [...]` line to add. The images `make smokescreen`/`observer`/`skopeo` need are the bootstrap and come from plain `podman pull`.
-- **Request-level policy for pulls (L7).** A pull's connections first go to `l7proxy` (`egress/l7proxy`, stdlib Go, `make l7proxy`) in the same proxy pod, chained in front of Smokescreen, so the host allowlist, IP rules, byte counts and the TLS observer all still apply. l7proxy terminates TLS with a leaf from an ephemeral ECDSA P-256 CA made in memory for that run. The private key is never written; the CA is name-constrained to the pull allowlist, and the guest trusts only it, so nothing gets around the proxy. Upstream it uses Go's crypto/tls against the host CA bundle. For each request it checks that:
+
+#### Confined pulls
+
+- `mvm pull`, `mvm update` and an image's first use pull through the same proxy and observer as fetch: a static skopeo (`make skopeo`, pure Go, in a `FROM scratch` image) is the microVM's only process and copies the image into a `dir:` layout under `~/.cache/mvm/pulls`.
+- Only after a clean run does the host load it offline (`podman pull dir:...`, which re-checks every blob digest) and pin it by the digest of its platform manifest (`dir:` keeps the registry's manifest bytes; an OCI archive would convert Docker manifests and change the digest).
+- The download is removed whatever happens. A registry outside the allowlist holds the pull (exit 3) with the `[allow] pull = [...]` line to add.
+- The images `make smokescreen`/`observer`/`skopeo` need are the bootstrap and come from plain `podman pull`.
+
+#### Request-level policy for pulls (L7)
+
+- A pull's connections first go to `l7proxy` (`egress/l7proxy`, stdlib Go, `make l7proxy`) in the same proxy pod, chained in front of Smokescreen, so the host allowlist, IP rules, byte counts and the TLS observer all still apply.
+- l7proxy terminates TLS with a leaf from an ephemeral ECDSA P-256 CA made in memory for that run. The private key is never written; the CA is name-constrained to the pull allowlist, and the guest trusts only it, so nothing gets around the proxy.
+- Upstream it uses Go's crypto/tls against the host CA bundle.
+- For each request it checks that:
   - the method is GET or HEAD;
   - the SNI, the `Host` header and the CONNECT host are the same;
   - the path is `/v2/` or `/v2/<this repository>/...` on the registry;
   - a token is for pulling this repository only (`auth.docker.io/token`, `ghcr.io/token`);
   - a blob CDN URL is exactly the host and path a registry redirect named.
+- Escaped or dot-segment paths are refused. A refusal holds the pull (exit 3).
+- Other registries' token endpoints are hand rules, e.g. `[[l7.pull]] host = "quay.io"`, `exact = ["/v2/auth"]`, `scope = "repository:{repo}:pull"`.
+- Fetch stays pass-through (Smokescreen + observer), so the client's own JA4 and SPLT are what the observer sees.
 
-  Escaped or dot-segment paths are refused. A refusal holds the pull (exit 3). Other registries' token endpoints are hand rules, e.g. `[[l7.pull]] host = "quay.io"`, `exact = ["/v2/auth"]`, `scope = "repository:{repo}:pull"`. Fetch stays pass-through (Smokescreen + observer), so the client's own JA4 and SPLT are what the observer sees.
-- **Confined image builds.** `mvm image build -t localhost/NAME:TAG -f Containerfile` runs `podman --runtime krun build`, so every RUN step (apk/apt and their install scripts) runs in a KVM microVM, on the same confined network as fetch: the per-run proxy (TCP 443 only) and the observer, allowing only OS package mirrors (`dl-cdn.alpinelinux.org`, `deb.debian.org`, `security.debian.org`; more with `[allow] image-build = [...]`; sources on `http://` fail, use the mirrors' https). The build context is an empty directory holding only the Containerfile, so project files and secrets are never in it (COPY of local files fails). Missing base images come through the confined pull first, then `--pull=never --no-cache`. It builds under a temporary tag and gets yours only after a clean run; a held or failed build deletes it (exit 3/4/5). Base images are used by their pinned digest (FROM is rewritten in the build's copy). Refused up front: `ADD` except heredocs (the context is empty, so ADD could only fetch a URL or git repository, which podman does on the host), `RUN --network=...` and `--security=...`, a `# escape=` other than backslash, and `FROM` with build variables. Proxy build args do not end up in the image's environment.
-- **Egress only through an allowlist proxy.** A fetch VM's network is pasta bound to loopback with one forwarded port, where a per-run [Smokescreen](https://github.com/stripe/smokescreen) (Stripe's egress proxy) allows only the ecosystem's registries. No DNS, no direct connections, no UDP, ICMP or IPv6 (each proven with real krun runs). Every connection is logged with bytes in/out; denials are printed and kept in the run record.
-- **A denial holds the run.** If a fetch exits 0 but tried a denied host, nothing is committed or copied back and mvm exits 3; if the proxy died or its log is unreadable, exit 4.
-- **Observer (on by default).** mvm's own passive TLS sensor (`mvm/tlsobs.py`, stdlib Python, in the official Python image pinned by digest) runs as a sidecar in the proxy pod. For every outbound connection it reassembles the start of the client's stream and records whether it is a TLS ClientHello, its SNI and [JA4](https://github.com/FoxIO-LLC/ja4) fingerprint, and the bytes each way. A TLS name outside the allowlist, no SNI, a connection that is not TLS (e.g. plaintext HTTP through CONNECT) or conflicting retransmissions hold the run like a denial (exit 3): the proxy only sees the CONNECT host, so this catches SNI-level domain fronting. Fronting by the HTTP `Host` header inside the encrypted connection (allowed SNI, another site on the same CDN) is invisible to any passive observer; it depends on the CDN refusing mismatches. It fails closed: a missing image refuses the fetch; a dead sensor, unreadable flows, kernel packet drops, or a proxy connection with no observed flow means nothing is committed (exit 5). It is written clean-room from the RFCs and FoxIO's BSD-3 JA4 spec; real tests check it against nDPI 5.0 on the same packets. `[observer] enabled = false` turns it off; `mvm status` prints `observer off` then. Observe-only, for encrypted traffic analysis (nothing is enforced on these): each flow also records kernel timestamps (`ts_start`, `duration_ms`), packets each way, `data_ratio` (bytes out / total), the first ALPN, the offered TLS version, and SPLT, the first 20 data packets as `[±payload bytes, ms since the previous one]` (+ out, − in). They go into the run record (the last 200 runs; `~/.local/state/mvm` is 0700); `[observer] log = "/abs/path/flows.jsonl"` (off by default) also appends every flow with its `run_id`, `kind` and `eco`, for a long-term corpus.
-- **Dependency check before every fetch.** [osv-scanner](https://github.com/google/osv-scanner) checks the lockfiles in a microVM that sees only them and reaches only `api.osv.dev` through the same proxy. A package with an OSV `MAL-` advisory ([OpenSSF malicious packages](https://github.com/ossf/malicious-packages)) refuses the fetch (exit 6); known vulnerabilities are printed and recorded, not blocking. If a fetch command changed the lockfile (`npm install x`), the new lockfile is checked before anything is committed or copied back. A lockfile that lists no packages (fresh `npm init`) passes; any other check that cannot complete refuses the fetch (`[check] before_fetch = false` turns it off). Call analysis and manifest resolution are off (`--no-call-analysis=all --no-resolve`): nothing runs and no other host is needed.
-- **Daily check and notifications.** `mvm check --all` checks every project mvm has fetched or checked; `make timer` installs it as a daily systemd user timer. With `[notify] ntfy = "https://ntfy.sh/<topic>"`, trips (malicious packages, held runs, failed proxy/observer, failed checks) are posted there. `mvm status` shows the last check per project and the trips of the last 24 hours.
-- **Learning hosts:** `mvm fetch --learn` lets everything through the proxy but logs it, commits nothing, and prints the hosts outside the allowlist with the exact `[allow]` line to add.
+#### Confined image builds
+
+- `mvm image build -t localhost/NAME:TAG -f Containerfile` runs `podman --runtime krun build`, so every RUN step (apk/apt and their install scripts) runs in a KVM microVM, on the same confined network as fetch: the per-run proxy (TCP 443 only) and the observer, allowing only OS package mirrors (`dl-cdn.alpinelinux.org`, `deb.debian.org`, `security.debian.org`; more with `[allow] image-build = [...]`; sources on `http://` fail, use the mirrors' https).
+- The build context is an empty directory holding only the Containerfile, so project files and secrets are never in it (COPY of local files fails).
+- Missing base images come through the confined pull first, then `--pull=never --no-cache`. Base images are used by their pinned digest (FROM is rewritten in the build's copy).
+- It builds under a temporary tag and gets yours only after a clean run; a held or failed build deletes it (exit 3/4/5).
+- Refused up front: `ADD` except heredocs (the context is empty, so ADD could only fetch a URL or git repository, which podman does on the host), `RUN --network=...` and `--security=...`, a `# escape=` other than backslash, and `FROM` with build variables.
+- Proxy build args do not end up in the image's environment.
 
 ## State
 
@@ -97,8 +151,9 @@ Built-in allowlists: go `proxy.golang.org`, `sum.golang.org`, `storage.googleapi
 - Never run node, npm, go, cargo or similar dev tooling directly on the host; use `mvm` (`man mvm`):
   - Download or change dependencies: `mvm fetch`, `mvm fetch go -- go get x@v1`
   - Build/test offline: `mvm build -w build -- go build -o build/app ./...`
-  - Anything else: `mvm run -i IMAGE -- CMD`
-- Network exists only in `mvm fetch`. Do not work around it.
+  - Anything else: `mvm run -i IMAGE -- CMD` (as a non-root user: `mvm run -u 1000:1000 -i IMAGE -- CMD`)
+  - Images: `mvm pull docker.io/library/alpine:3.24`; build one with `mvm image build -t localhost/NAME:TAG -f Containerfile`
+- Network exists only in `mvm fetch`, `mvm pull` and `mvm image build`, each confined to an allowlist. Do not work around it.
 ```
 
 ## Requirements and install

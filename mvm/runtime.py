@@ -48,7 +48,8 @@ class Plan:
     # image build: the podman command from (confined network args, proxy port) instead of a VM run
     argv_fn: Callable[[list[str], int], list[str]] | None = None
     l7: dict | None = None              # pulls: l7proxy policy + upstream roots (see egress.Proxy)
-    l7_ca: Path | None = None           # where the run's ephemeral CA certificate goes, for the guest    # extra -v specs (pull: CA bundle, output dir)
+    l7_ca: Path | None = None           # where the run's ephemeral CA certificate goes, for the guest
+    user: str = ""            # run only: podman --user (build/fetch need guest root to loop-mount caches)
 
 
 def new_run_id() -> str:
@@ -69,6 +70,10 @@ def podman_argv(plan: Plan, run_id: str, mounts: dict[str, Path], empty_dir: Pat
             "--name", f"mvm-{run_id}", "--label", f"mvm.run={run_id}",
             "--label", f"mvm.pid={os.getpid()}"]
     argv += net_args if plan.net else ["--network=none"]
+    if plan.user:
+        if plan.kind != "run" or plan.caches:
+            raise core.MvmError("--user is only for mvm run (caches are mounted as guest root)")
+        argv += ["--user", plan.user]
     if plan.interactive:
         argv.append("-it")
     if plan.src is not None:

@@ -33,7 +33,7 @@ _mvm() {
     fetch) _arguments '--learn[allow but log every host, commit nothing]' '1::ecosystem:(go rust node)' ;;
     check) _arguments '--all[every project mvm knows]' ;;
     build) _arguments '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' '1::ecosystem:(go rust node)' ;;
-    run)   _arguments '-i[image]:image:' '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' ;;
+    run)   _arguments '-i[image]:image:' '(-u --user)'{-u,--user}'[run as USER, UID or UID:GID]:user:' '*-w[make DIR writable]:dir:_directories' '--it[interactive terminal]' ;;
     cache)
       if (( CURRENT == 3 )); then
         _values 'cache command' rm grow gc
